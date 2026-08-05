@@ -10,7 +10,6 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -18,7 +17,7 @@ import webbrowser
 import winreg
 
 APP_NAME = "NovelAI Artist Ranker"
-APP_VERSION = "2.5.3"
+APP_VERSION = "2.6.0"
 SERVER = "http://127.0.0.1:7860"
 MUTEX_NAME = r"Local\NovelAIArtistRankerLauncher"
 AUTOSTART_VALUE = "NovelAI Artist Ranker"
@@ -47,6 +46,28 @@ APP_DIR = INSTALL_DIR / "app"
 RUNTIME_DIR = INSTALL_DIR / "runtime"
 PYTHON_EXE = RUNTIME_DIR / "python.exe"
 RANKER_SCRIPT = APP_DIR / "artist_elo_ranker_buffered.py"
+
+def _apply_local_path_overrides() -> None:
+    """Load optional machine-local paths without baking them into public packages."""
+    path = RUNTIME_DIR / "user_paths.json"
+    if not path.is_file():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return
+    for field, environment_name in (
+        ("data_root", "ARTIST_RANKER_DATA_DIR"),
+        ("local_app_data", "LOCALAPPDATA"),
+    ):
+        value = str(payload.get(field, "") or "").strip()
+        if not value:
+            continue
+        candidate = Path(os.path.expandvars(value)).expanduser()
+        if candidate.is_absolute():
+            os.environ[environment_name] = str(candidate)
+
+_apply_local_path_overrides()
 LOCAL_ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME
 LOG_DIR = LOCAL_ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)

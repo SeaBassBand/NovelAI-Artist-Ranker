@@ -31,8 +31,56 @@ for name in ("build_public_release.py", "public_launcher.pyw", "uninstall.pyw"):
     assert path.is_file(), name
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
-for name in ("LICENSE", "SECURITY.md", "BUILDING.md", "FOLDER_LAYOUT.md", "THIRD_PARTY_NOTICES.md", "requirements.lock.txt"):
+for name in ("install_public.ps1", "launcher_guard.ps1", "run_visible.ps1", "copy_recent_logs.ps1"):
+    assert (ROOT / "packaging" / name).is_file(), name
+
+launcher_source = (ROOT / "packaging" / "public_launcher.pyw").read_text(encoding="utf-8")
+install_source = (ROOT / "packaging" / "install_public.ps1").read_text(encoding="utf-8")
+visible_source = (ROOT / "packaging" / "run_visible.ps1").read_text(encoding="utf-8")
+assert 'APP_VERSION = "2.6.0"' in launcher_source
+assert "user_paths.json" in launcher_source + install_source + visible_source
+assert 'ForEach-Object { $_.ToString() }' in visible_source
+assert '$ErrorActionPreference = "Continue"' in visible_source
+
+for name in (
+    "LICENSE", "SECURITY.md", "BUILDING.md", "FOLDER_LAYOUT.md", "THIRD_PARTY_NOTICES.md",
+    "SECURITY_DEPENDENCIES.md", "requirements.lock.txt", "DEPENDENCY_INVENTORY.json",
+):
     assert (ROOT / name).is_file(), name
+
+main_source = (SRC / "artist_elo_ranker_buffered.py").read_text(encoding="utf-8")
+recovery_source = (SRC / "backup_transfer_recovery.py").read_text(encoding="utf-8")
+guidance_source = (SRC / "onboarding_guidance.py").read_text(encoding="utf-8")
+builder_source = (ROOT / "packaging" / "build_public_release.py").read_text(encoding="utf-8")
+assert 'SHAREABLE_EDITION_VERSION = "2.6.0"' in main_source
+assert 'GITHUB_REPOSITORY = "SeaBassBand/NovelAI-Artist-Ranker"' in main_source
+assert 'DEFAULT_GITHUB_REPOSITORY = "SeaBassBand/NovelAI-Artist-Ranker"' in recovery_source
+assert "example.invalid" not in main_source + recovery_source
+assert "const CACHE='artist-elo-duel-v8'" in main_source
+assert "!SHELL_PATHS.has(url.pathname)" in main_source
+assert "ssr_mode=False" in main_source
+assert "__artistEloGalleryArtistPickerLifecycle" in main_source
+assert '"storage_settings": 4' in guidance_source
+assert '"dedicated_duel": 2' in guidance_source
+assert '"android_app": 4' in guidance_source
+assert "PYTHONDONTWRITEBYTECODE" in builder_source
+assert '"-B", "-I", "-c"' in builder_source
+ranker_start = main_source.index("ranker = ArtistELORanker()")
+backup_log = main_source.index('print(f"Backup compartment: {ranker.transfer_recovery.backup_root}")')
+assert ranker_start < backup_log, "startup logging must not access ranker before it is created"
+
+android_manifest = ROOT / "android-builder" / "project" / "app" / "src" / "main" / "AndroidManifest.xml"
+android_activity = ROOT / "android-builder" / "project" / "app" / "src" / "main" / "java" / "com" / "sebas" / "artistranker" / "MainActivity.java"
+android_monitor = android_activity.with_name("BufferMonitorSupport.java")
+assert android_manifest.is_file()
+assert android_activity.is_file()
+assert 'android:scheme="artist-ranker"' in android_manifest.read_text(encoding="utf-8")
+assert 'android:allowBackup="false"' in android_manifest.read_text(encoding="utf-8")
+assert "handleDeepLinkIntent" in android_activity.read_text(encoding="utf-8")
+monitor_source = android_monitor.read_text(encoding="utf-8")
+assert "CookieManager.getInstance().getCookie(base)" in monitor_source
+assert "http://artist-ranker.local:7860" in monitor_source
+assert "LapSebas" not in monitor_source
 
 for path in ROOT.rglob("*"):
     if not path.is_file():

@@ -107,6 +107,7 @@ import socket
 import tempfile
 import threading
 import time
+import urllib.parse
 from collections import Counter, defaultdict, deque
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -166,16 +167,12 @@ from config import (
     DEFAULT_ELO,
     K_FACTOR,
     ACTIVE_POOL_SIZE,
-    NEW_ARTIST_PROBABILITY,
-    LOSER_ROTATION_PROBABILITY,
-    SERVER_HOST,
     SERVER_PORT,
     NEGATIVE_PROMPT,
     DEFAULT_PROMPT,
 )
 
 from novelai_credential_store import (
-    CredentialStoreError,
     credential_status,
     delete_api_key,
     is_configured as novelai_key_is_configured,
@@ -187,7 +184,6 @@ from novelai_credential_store import (
 )
 
 from ranker_data_layout import (
-    APP_NAME as DATA_APP_NAME,
     CONFIG_SCHEMA_VERSION,
     DATA_LAYOUT_SCHEMA_VERSION,
     DATA_SCHEMA_VERSION,
@@ -243,16 +239,12 @@ from generation_profiles import (
     apply_profile,
     build_profile,
     clean_profile_payload,
-    copy_profiles,
     default_generation_settings,
     enum_value,
-    infer_resolution_preset,
     normalize_generation_settings,
     normalize_profile,
     normalize_sampler,
     normalize_scheduler,
-    profile_summary,
-    resolve_resolution,
     snapshot_profile,
 )
 
@@ -678,7 +670,6 @@ LAN_SERVER_HOST = os.environ.get("ARTIST_ELO_SERVER_HOST", "0.0.0.0").strip() or
 
 MODEL = Model.NAI_DIFFUSION_4_5_FULL
 SAMPLER = Sampler.K_EULER_ANCESTRAL
-UC_PRESET = UCPreset.TYPE0
 BUFFER_TARGET_SIZE = 5
 
 DEFAULT_SAMPLER_ID = normalize_sampler(enum_value(SAMPLER, "k_euler_ancestral"))
@@ -789,7 +780,7 @@ SECURE_SETUP_HEAD = ""
 
 # PERMANENT_GLOBAL_DUEL_DIAGNOSTICS_V1
 # Full diagnostics are globally disabled by default and add only one cheap boolean
-# branch to duel callbacks while off. When enabled in Storage / Settings, server-side
+# branch to duel callbacks while off. When enabled in Settings, server-side
 # callbacks are profiled, browser click-to-render transitions are captured, logs rotate
 # automatically, and a redacted ZIP can be exported for remote diagnosis.
 DIAGNOSTICS_DIR = DATA_LAYOUT.path("diagnostics_dir")
@@ -850,6 +841,15 @@ def _diag_redact_text(text: str) -> str:
     ]
     for pattern, replacement in patterns:
         value = re.sub(pattern, replacement, value)
+    path_aliases = [
+        (str(Path.home()), "<USER_HOME>"),
+        (str(globals().get("DATA_ROOT", "") or ""), "<DATA_ROOT>"),
+        (str(globals().get("SCRIPT_DIR", "") or ""), "<PROGRAM_DIR>"),
+    ]
+    for raw, alias in sorted(path_aliases, key=lambda item: len(item[0]), reverse=True):
+        if raw:
+            value = value.replace(raw, alias).replace(raw.replace("\\", "/"), alias)
+    value = re.sub(r"(?i)C:\\Users\\[^\\\s\"']+", r"C:\\Users\\<USER>", value)
     return value
 
 
@@ -1134,20 +1134,38 @@ class _ArtistRankerDiagnostics:
 
             with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 archive.writestr("README.txt", readme)
-                archive.writestr("summary.json", json.dumps(summary, ensure_ascii=False, indent=2, default=str))
-                archive.writestr("thread_stacks.txt", _diag_thread_dump())
-                archive.writestr("environment.txt", "\n".join(environment_lines))
+                archive.writestr(
+                    "summary.json",
+                    _diag_redact_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str)),
+                )
+                archive.writestr("thread_stacks.txt", _diag_redact_text(_diag_thread_dump()))
+                archive.writestr("environment.txt", _diag_redact_text("\n".join(environment_lines)))
                 for log_path in (DIAGNOSTICS_SERVER_LOG, DIAGNOSTICS_BROWSER_LOG):
                     if log_path.exists():
-                        archive.write(log_path, arcname=f"logs/{log_path.name}")
+                        archive.writestr(
+                            f"logs/{log_path.name}",
+                            _diag_redact_text(log_path.read_text(encoding="utf-8", errors="replace")),
+                        )
                     for index in range(1, DIAGNOSTICS_ROTATED_LOGS + 2):
                         rotated = log_path.with_name(log_path.name + f".{index}")
                         if rotated.exists():
-                            archive.write(rotated, arcname=f"logs/{rotated.name}")
+                            archive.writestr(
+                                f"logs/{rotated.name}",
+                                _diag_redact_text(rotated.read_text(encoding="utf-8", errors="replace")),
+                            )
                 for optional_name in ("boot_diagnostics.log", "boot_diagnostics.json"):
                     optional_path = SCRIPT_DIR / optional_name
                     if optional_path.exists():
-                        archive.write(optional_path, arcname=f"logs/{optional_name}")
+                        archive.writestr(
+                            f"logs/{optional_name}",
+                            _diag_redact_text(optional_path.read_text(encoding="utf-8", errors="replace")),
+                        )
+                console_log = SCRIPT_DIR.parent / "runtime" / "last-console.log"
+                if console_log.exists():
+                    archive.writestr(
+                        "logs/last-console.log",
+                        _diag_redact_text(console_log.read_text(encoding="utf-8", errors="replace")),
+                    )
                 for path in source_paths:
                     if path.exists() and path.is_file():
                         try:
@@ -1279,7 +1297,6 @@ DIAGNOSTICS_HEAD = '\n<style>\n.diagnostics-hidden-bridge { display: none !impor
 # the selection-heavy endpoint while retaining a small discovery/screening budget.
 MATCHMAKING_MODE_COVERAGE = "coverage"
 MATCHMAKING_MODE_SELECTION = "selection"
-MATCHMAKING_MODE_CHOICES = (MATCHMAKING_MODE_COVERAGE, MATCHMAKING_MODE_SELECTION)
 AUTO_SELECTION_TAPER_START = 0.80
 FINAL_SELECTION_WEIGHTS = {
     "fresh": 0.02,
@@ -1307,31 +1324,15 @@ RETENTION_QUARANTINE_DIR = DATA_ROOT / "media" / "retention_quarantine"
 RETENTION_STATE_FILE = DATA_ROOT / "state" / "retention_state.json"
 MAX_NOVELAI_SEED = (2 ** 32) - 1
 
-# Phase 2 matchmaking balance. The goal is discovery of exceptional artists,
-# not a perfectly exhaustive ordering of every artist in the database.
-MATCH_CLOSE_PROBABILITY = 0.60
-MATCH_DISCOVERY_PROBABILITY = 0.20
-MATCH_NEWCOMER_PROBABILITY = 0.20
-MATCH_CANDIDATE_COUNT = 60
+# Recent-memory bounds used by the active matchmaking state.
 RECENT_MATCHUP_MEMORY = 400
 RECENT_COMBINATION_MEMORY = 800
 RECENT_ARTIST_MEMORY = 1600
-# Current and queued duels are provisional matchmaking evidence. They have not
-# been voted yet, but reusing the same artists while the rolling buffer is being
-# filled would create clusters of duplicate tests before ratings can catch up.
-BUFFERED_EXACT_MATCHUP_PENALTY = 100000.0
-BUFFERED_COMBINATION_PENALTY = 5000.0
-BUFFERED_ARTIST_PENALTY = 750.0
-NEWCOMER_EVALUATION_MATCHES = 6
-NEWCOMER_PROTECTION_MATCHES = 2
-NEWCOMER_FAST_FLUSH_MIN_MATCHES = 3
-ESTABLISHED_MIN_MATCHES = 8
-FRESH_ARTIST_ENTRY_PROBABILITY = 0.80
-POOL_CYCLE_PROBABILITY = 0.35
 # SHAREABLE_EDITION_SECURE_CONFIGURATION_V190
 # API credentials are never embedded or read from config.py. They live only in
 # Windows Credential Manager and are fetched only when a NovelAI session is needed.
-SHAREABLE_EDITION_VERSION = "2.5.3"
+SHAREABLE_EDITION_VERSION = "2.6.0"
+GITHUB_REPOSITORY = "SeaBassBand/NovelAI-Artist-Ranker"
 # SHAREABLE_EDITION_GENERATION_PROFILES_V202
 # SHAREABLE_EDITION_STORAGE_RETENTION_V211
 # SHAREABLE_EDITION_PHONE_PAIRING_V220
@@ -1355,7 +1356,48 @@ PHONE_PAIRING = PairingManager(
 )
 PHONE_PAIRING_MDNS = RankerMDNSAdvertiser(PHONE_PAIRING)
 PHONE_PAIRING_PANEL_HTML = '<div class="pairing-admin" id="pairingAdminPanel">\n  <div class="pairing-admin-head"><div><h3>Phone pairing and LAN security</h3><p>Pair phones without sharing the NovelAI API key. Pairing codes expire after ten minutes and work once.</p></div><span class="pairing-admin-badge" id="pairingAdminStatus">Loading…</span></div>\n  <div class="pairing-admin-grid">\n    <section class="pairing-admin-card"><h4>Pair a device</h4><div class="pairing-admin-code" id="pairingAdminCode">— — — — — —</div><div class="pairing-admin-expiry" id="pairingAdminExpiry">Create a one-use code when the phone is ready.</div><div class="pairing-admin-actions"><button type="button" id="pairingCreateCode">Create 10-minute code + QR</button><button type="button" id="pairingCopyLink" disabled>Copy link</button></div><img id="pairingAdminQr" class="pairing-admin-qr" alt="Phone pairing QR code" hidden><div class="pairing-admin-link" id="pairingAdminLink"></div></section>\n    <section class="pairing-admin-card"><h4>Connection policy</h4><label for="pairingClientMode">Voting behavior</label><select id="pairingClientMode"><option value="single_active">Single active voting device</option><option value="multi_client">Allow multiple paired clients</option></select><p class="pairing-admin-help">Single-active mode prevents two phones from rating the same duel at nearly the same time. Read-only browsing remains available to every paired device.</p><div class="pairing-admin-kv"><span>Protocol</span><strong id="pairingProtocol">—</strong><span>Discovery</span><strong id="pairingDiscovery">—</strong><span>Firewall</span><strong>Private-network rules supplied in this Phase 5 folder</strong></div></section>\n  </div>\n  <section class="pairing-admin-card"><div class="pairing-admin-row"><div><h4>Paired devices</h4><p class="pairing-admin-help">Revoke a lost phone immediately. Reset pairing invalidates every device and creates a new installation identity.</p></div><div class="pairing-admin-actions"><button type="button" id="pairingRefresh">Refresh</button><button type="button" class="danger" id="pairingReset">Reset all pairing</button></div></div><div id="pairingDeviceList" class="pairing-device-list"><div class="pairing-device-empty">Loading paired devices…</div></div></section>\n  <div class="pairing-admin-message" id="pairingAdminMessage"></div>\n</div>\n'
-PHONE_PAIRING_CSS = '.pairing-admin{display:grid;gap:12px}.pairing-admin-head,.pairing-admin-row{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.pairing-admin h3,.pairing-admin h4{margin:0}.pairing-admin p{margin:4px 0 0;color:color-mix(in srgb,var(--body-text-color,currentColor) 72%,transparent)}.pairing-admin-badge{flex:0 0 auto;padding:5px 9px;border:1px solid var(--border-color-primary,currentColor);border-radius:999px;font-size:.72rem;font-weight:800}.pairing-admin-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.pairing-admin-card{padding:13px;border:1px solid var(--border-color-primary,currentColor);border-radius:12px;background:color-mix(in srgb,var(--block-background-fill,transparent) 95%,var(--body-text-color,currentColor) 5%)}.pairing-admin-code{margin-top:10px;font:850 1.45rem/1.1 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.15em}.pairing-admin-expiry,.pairing-admin-help,.pairing-admin-link,.pairing-admin-message{font-size:.76rem;line-height:1.4}.pairing-admin-actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}.pairing-admin button,.pairing-admin select{min-height:34px;border:1px solid var(--border-color-primary,currentColor);border-radius:8px;background:var(--button-secondary-background-fill,var(--block-background-fill,transparent));color:inherit;padding:6px 10px}.pairing-admin button{cursor:pointer;font-weight:760}.pairing-admin button:disabled{opacity:.45;cursor:wait}.pairing-admin button.danger{color:var(--error-text-color,#d33)}.pairing-admin select{width:100%;margin-top:6px}.pairing-admin-qr{display:block;width:min(240px,100%);margin:12px auto 0;border:10px solid white;border-radius:10px;background:white}.pairing-admin-link{margin-top:8px;overflow-wrap:anywhere}.pairing-admin-kv{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;margin-top:11px;font-size:.76rem}.pairing-admin-kv span{opacity:.68}.pairing-device-list{display:grid;gap:7px;margin-top:10px}.pairing-device{display:grid;grid-template-columns:minmax(130px,1fr) auto auto;gap:8px;align-items:center;padding:9px 10px;border:1px solid color-mix(in srgb,var(--border-color-primary,currentColor) 70%,transparent);border-radius:9px}.pairing-device-name{font-weight:800}.pairing-device-meta{font-size:.7rem;opacity:.7}.pairing-device button{min-height:30px}.pairing-device.revoked{opacity:.5}.pairing-device-empty{padding:10px;opacity:.65}.pairing-admin-message.error{color:var(--error-text-color,#d33)}.pairing-admin-message.success{color:#1b9b62}@media(max-width:760px){.pairing-admin-grid{grid-template-columns:1fr}.pairing-admin-head,.pairing-admin-row{flex-direction:column}.pairing-device{grid-template-columns:1fr auto}.pairing-device-meta{grid-column:1/-1}}\n'
+PHONE_PAIRING_PANEL_HTML = PHONE_PAIRING_PANEL_HTML.replace(
+    '<div class="pairing-admin-link" id="pairingAdminLink"></div>',
+    '<div class="pairing-admin-link" id="pairingAdminLink"></div>'
+    '<p class="pairing-admin-help"><strong>QR behavior:</strong> scanning opens the installed Artist Ranker Android app directly. '
+    'If the app is not installed yet, open this ranker in the phone browser and download the matching APK from its Install app control.</p>',
+)
+PHASE9_SETTINGS_HEAD = r'''
+<style>
+.artist-ranker-maintenance-settings{margin-top:14px;padding-top:12px;border-top:1px solid var(--border-color-primary,currentColor)}
+.artist-ranker-maintenance-settings h3{margin:0 0 4px}.artist-ranker-maintenance-settings p{font-size:.78rem;opacity:.72;margin:0 0 9px}
+.artist-ranker-settings-grid{display:grid;gap:9px}.artist-ranker-settings-grid label{display:grid;grid-template-columns:1fr auto;align-items:center;gap:12px;font-size:.84rem}
+.artist-ranker-settings-grid input[type=number],.artist-ranker-settings-grid select{min-width:112px;border:1px solid var(--border-color-primary,currentColor);border-radius:8px;background:var(--input-background-fill,transparent);color:inherit;padding:6px 8px}
+.artist-ranker-settings-actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}.artist-ranker-settings-actions button{min-height:34px;border:1px solid var(--border-color-primary,currentColor);border-radius:8px;background:var(--button-secondary-background-fill,transparent);color:inherit;padding:6px 10px;font-weight:700}
+</style>
+<script>
+(() => {
+  if(window.__artistRankerPhase9Settings)return;window.__artistRankerPhase9Settings=true;
+  const HELP_KEY='artistRanker.guidance.helpButtonVisible';
+  const inputOf=id=>{const root=document.getElementById(id);return root?(root.matches?.('input,textarea,select')?root:root.querySelector('input,textarea,select')):null};
+  const buttonOf=id=>{const root=document.getElementById(id);return root?(root.matches?.('button')?root:root.querySelector('button')):null};
+  const setValue=(element,value)=>{if(!element)return;if(element.type==='checkbox'){const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'checked');d?.set?d.set.call(element,Boolean(value)):element.checked=Boolean(value)}else{const p=element.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype,d=Object.getOwnPropertyDescriptor(p,'value');d?.set?d.set.call(element,String(value)):element.value=String(value)}element.dispatchEvent(new Event('input',{bubbles:true}));element.dispatchEvent(new Event('change',{bubbles:true}))};
+  const radioValue=id=>document.querySelector(`#${id} input[type=radio]:checked`)?.value||'';
+  const setRadio=(id,value)=>{const radio=[...document.querySelectorAll(`#${id} input[type=radio]`)].find(node=>node.value===value);radio?.click()};
+  function install(){
+    if(document.getElementById('artist-ranker-maintenance-settings'))return true;
+    const lists=[...document.querySelectorAll('ul.theme-buttons')],nativeList=lists.find(list=>list.offsetParent!==null)||lists[0];if(!nativeList)return false;
+    const host=nativeList.parentElement;if(!host)return false;const panel=document.createElement('section');panel.id='artist-ranker-maintenance-settings';panel.className='artist-ranker-maintenance-settings';
+    panel.innerHTML=`<h3>Maintenance preferences</h3><p>Low-frequency settings moved here to keep the Maintenance Center focused on actions and status.</p><div class="artist-ranker-settings-grid"><label><span>Show floating Help button</span><input data-p9="help" type="checkbox"></label><label><span>Detailed duel diagnostics</span><input data-p9="diagnostics" type="checkbox"></label><label><span>Matchmaking strategy</span><select data-p9="matchmaking"><option value="coverage">Coverage with automatic taper</option><option value="selection">Selection / Top-100 focus</option></select></label><label><span>Clean cache every N images</span><input data-p9="cleanupEvery" type="number" min="1" max="10000"></label><label><span>Remove N oldest cache entries</span><input data-p9="cleanupOldest" type="number" min="1" max="5000"></label><label><span>Orphan scan minimum age (days)</span><input data-p9="orphanAge" type="number" min="0" max="3650" step="0.5"></label></div><div class="artist-ranker-settings-actions"><button type="button" data-p9-action="save">Save maintenance preferences</button><button type="button" data-p9-action="open">Open Maintenance Center</button></div>`;
+    host.appendChild(panel);const q=name=>panel.querySelector(`[data-p9="${name}"]`);const storedHelp=localStorage.getItem(HELP_KEY);q('help').checked=storedHelp===null?Boolean(inputOf('show-floating-help-button-setting')?.checked):storedHelp!=='false';q('diagnostics').checked=Boolean(inputOf('full-diagnostics-enabled')?.checked);q('matchmaking').value=radioValue('maintenance-matchmaking-mode')||'coverage';q('cleanupEvery').value=inputOf('maintenance-cleanup-every')?.value||50;q('cleanupOldest').value=inputOf('maintenance-cleanup-oldest')?.value||25;q('orphanAge').value=inputOf('maintenance-orphan-age')?.value||2;
+    q('help').addEventListener('change',()=>setValue(inputOf('show-floating-help-button-setting'),q('help').checked));q('diagnostics').addEventListener('change',()=>setValue(inputOf('full-diagnostics-enabled'),q('diagnostics').checked));q('matchmaking').addEventListener('change',()=>setRadio('maintenance-matchmaking-mode',q('matchmaking').value));panel.querySelector('[data-p9-action=save]').addEventListener('click',()=>{setValue(inputOf('maintenance-cleanup-every'),q('cleanupEvery').value);setValue(inputOf('maintenance-cleanup-oldest'),q('cleanupOldest').value);setValue(inputOf('maintenance-orphan-age'),q('orphanAge').value);buttonOf('maintenance-cleanup-save')?.click()});panel.querySelector('[data-p9-action=open]').addEventListener('click',()=>{[...document.querySelectorAll('[role=tab],button')].find(node=>String(node.textContent||'').trim()==='Maintenance')?.click()});return true;
+  }
+  window.addEventListener('artist-ranker-help-visibility',event=>{const input=document.querySelector('#artist-ranker-maintenance-settings [data-p9="help"]');if(input)input.checked=Boolean(event.detail?.visible)});
+  const observer=new MutationObserver(()=>install()),start=()=>{install();observer.observe(document.documentElement,{subtree:true,childList:true})};if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start,{once:true});else start();
+})();
+</script>
+'''
+
+PHONE_PAIRING_CSS = '.pairing-admin{display:grid;gap:12px}.pairing-admin-head,.pairing-admin-row{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.pairing-admin h3,.pairing-admin h4{margin:0}.pairing-admin p{margin:4px 0 0;color:color-mix(in srgb,var(--body-text-color,currentColor) 72%,transparent)}.pairing-admin-badge{flex:0 0 auto;padding:5px 9px;border:1px solid var(--border-color-primary,currentColor);border-radius:999px;font-size:.72rem;font-weight:800}.pairing-admin-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.pairing-admin-card{padding:13px;border:1px solid var(--border-color-primary,currentColor);border-radius:12px;background:color-mix(in srgb,var(--block-background-fill,transparent) 95%,var(--body-text-color,currentColor) 5%)}.pairing-admin-code{margin-top:10px;font:850 1.45rem/1.1 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.15em}.pairing-admin-expiry,.pairing-admin-help,.pairing-admin-link,.pairing-admin-message{font-size:.76rem;line-height:1.4}.pairing-admin-actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}.pairing-admin button,.pairing-admin select{min-height:34px;border:1px solid var(--border-color-primary,currentColor);border-radius:8px;background:var(--button-secondary-background-fill,var(--block-background-fill,transparent));color:inherit;padding:6px 10px}.pairing-admin button{cursor:pointer;font-weight:760}.pairing-admin button:disabled{opacity:.45;cursor:wait}.pairing-admin button.danger{color:var(--error-text-color,#d33)}.pairing-admin select{width:100%;margin-top:6px}.pairing-admin-qr{display:block;width:min(240px,100%);margin:12px auto 0;border:10px solid white;border-radius:10px;background:white}.pairing-admin-link{margin-top:8px;overflow-wrap:anywhere}.pairing-admin-kv{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;margin-top:11px;font-size:.76rem}.pairing-admin-kv span{opacity:.68}.pairing-device-list{display:grid;gap:7px;margin-top:10px}.pairing-device{display:grid;grid-template-columns:minmax(130px,1fr) auto auto;gap:8px;align-items:center;padding:9px 10px;border:1px solid color-mix(in srgb,var(--border-color-primary,currentColor) 70%,transparent);border-radius:9px}.pairing-device-name{font-weight:800}.pairing-device-meta{font-size:.7rem;opacity:.7}.pairing-admin-message.error{color:var(--error-text-color,#d33)}.pairing-admin-message.success{color:#1b9b62}@media(max-width:760px){.pairing-admin-grid{grid-template-columns:1fr}.pairing-admin-head,.pairing-admin-row{flex-direction:column}.pairing-device{grid-template-columns:1fr auto}.pairing-device-meta{grid-column:1/-1}}\n'
+PHONE_PAIRING_CSS += (
+    '.pairing-device button{min-height:30px}.pairing-device.revoked{opacity:.5}'
+    '.pairing-device-empty{padding:10px;opacity:.65}'
+)
 PHONE_PAIRING_HEAD = '<script>\n(() => {\n  if(window.__artistRankerPairingAdminV220)return;window.__artistRankerPairingAdminV220=true;\n  const $=id=>document.getElementById(id);let currentLink=\'\',expiryTimer=0;\n  const message=(text=\'\',kind=\'\')=>{const node=$(\'pairingAdminMessage\');if(!node)return;node.textContent=text;node.className=\'pairing-admin-message\'+(kind?` ${kind}`:\'\')};\n  const json=async(response)=>{let body={};try{body=await response.json()}catch{}if(!response.ok)throw new Error(body.detail||body.error||`HTTP ${response.status}`);return body};\n  const when=value=>{if(!value)return\'Never\';try{return new Date(Number(value)*1000).toLocaleString()}catch{return\'Unknown\'}};\n  function renderDevices(devices=[]){const host=$(\'pairingDeviceList\');if(!host)return;const active=devices.filter(item=>!item.revoked);$(\'pairingAdminStatus\').textContent=`${active.length} paired`;if(!devices.length){host.innerHTML=\'<div class="pairing-device-empty">No phones are paired yet.</div>\';return}host.innerHTML=devices.map(item=>`<div class="pairing-device ${item.revoked?\'revoked\':\'\'}"><div><div class="pairing-device-name">${escapeHtml(item.name||\'Paired device\')}</div><div class="pairing-device-meta">Last seen ${escapeHtml(when(item.last_seen_at))}${item.last_ip?` · ${escapeHtml(item.last_ip)}`:\'\'}</div></div><div class="pairing-device-meta">Protocol ${Number(item.client_protocol||0)}</div>${item.revoked?\'<span>Revoked</span>\':`<button type="button" data-revoke-device="${escapeHtml(item.device_id)}">Revoke</button>`}</div>`).join(\'\')}\n  const escapeHtml=value=>String(value??\'\').replace(/[&<>"\']/g,char=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[char]));\n  async function refresh(){try{const body=await json(await fetch(\'/api/pairing/admin/status\',{cache:\'no-store\'}));$(\'pairingClientMode\').value=body.client_mode||\'single_active\';$(\'pairingProtocol\').textContent=`${body.protocol_current} (supports ${body.protocol_min}–${body.protocol_max})`;$(\'pairingDiscovery\').textContent=body.discovery?.running?\'Advertising through Android NSD / mDNS\':(body.discovery?.last_error||\'Starting…\');renderDevices(body.devices||[]);message(\'\')}catch(error){message(error.message||String(error),\'error\')}}\n  async function createCode(){const button=$(\'pairingCreateCode\');button.disabled=true;try{const body=await json(await fetch(\'/api/pairing/admin/code\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:\'{}\'}));currentLink=body.primary_link||\'\';$(\'pairingAdminCode\').textContent=(body.code||\'\').split(\'\').join(\' \');$(\'pairingAdminLink\').textContent=currentLink;$(\'pairingCopyLink\').disabled=!currentLink;const qr=$(\'pairingAdminQr\');qr.src=`${body.qr_url}&t=${Date.now()}`;qr.hidden=false;clearInterval(expiryTimer);const update=()=>{const remain=Math.max(0,Math.ceil(Number(body.expires_at||0)-Date.now()/1000));$(\'pairingAdminExpiry\').textContent=remain?`Expires in ${Math.floor(remain/60)}:${String(remain%60).padStart(2,\'0\')}`:\'Expired — create a new code.\';if(!remain)clearInterval(expiryTimer)};update();expiryTimer=setInterval(update,1000);message(\'One-use pairing code created.\',\'success\')}catch(error){message(error.message||String(error),\'error\')}finally{button.disabled=false}}\n  async function setMode(){try{await json(await fetch(\'/api/pairing/admin/client-mode\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({mode:$(\'pairingClientMode\').value})}));message(\'Connection policy saved.\',\'success\');refresh()}catch(error){message(error.message||String(error),\'error\')}}\n  async function revoke(deviceId){if(!confirm(\'Revoke this paired device?\'))return;try{await json(await fetch(\'/api/pairing/admin/revoke\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({device_id:deviceId})}));message(\'Device revoked.\',\'success\');refresh()}catch(error){message(error.message||String(error),\'error\')}}\n  async function reset(){if(!confirm(\'Reset all pairing? Every phone will need a new code.\'))return;try{await json(await fetch(\'/api/pairing/admin/reset\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({confirmed:true})}));currentLink=\'\';$(\'pairingAdminCode\').textContent=\'— — — — — —\';$(\'pairingAdminQr\').hidden=true;$(\'pairingAdminLink\').textContent=\'\';message(\'Pairing identity reset.\',\'success\');refresh()}catch(error){message(error.message||String(error),\'error\')}}\n  function install(){const panel=$(\'pairingAdminPanel\');if(!panel||panel.dataset.bound===\'1\')return false;panel.dataset.bound=\'1\';$(\'pairingCreateCode\').addEventListener(\'click\',createCode);$(\'pairingCopyLink\').addEventListener(\'click\',async()=>{try{await navigator.clipboard.writeText(currentLink);message(\'Pairing link copied.\',\'success\')}catch{message(\'Could not copy automatically. Select the link text instead.\',\'error\')}});$(\'pairingRefresh\').addEventListener(\'click\',refresh);$(\'pairingClientMode\').addEventListener(\'change\',setMode);$(\'pairingReset\').addEventListener(\'click\',reset);$(\'pairingDeviceList\').addEventListener(\'click\',event=>{const button=event.target.closest(\'[data-revoke-device]\');if(button)revoke(button.dataset.revokeDevice)});refresh();return true}\n  const observer=new MutationObserver(()=>install());const start=()=>{install();observer.observe(document.documentElement,{subtree:true,childList:true})};if(document.readyState===\'loading\')document.addEventListener(\'DOMContentLoaded\',start,{once:true});else start();\n})();\n</script>\n'
 
 
@@ -1392,60 +1434,11 @@ def generation_profile_ownership_help(ownership: Any) -> str:
 # Top-focused uncertainty model and staged evaluation. Legacy ELO remains available
 # for compatibility, while these values drive the official ranking and pool decisions.
 TOP_SKILL_DEFAULT_MU = 1500.0
-TOP_SKILL_DEFAULT_SIGMA = 350.0
-TOP_SKILL_MIN_SIGMA = 45.0
-TOP_SKILL_CONSERVATIVE_Z = 2.0
-TOP_SKILL_POTENTIAL_Z = 1.5
-TOP_SKILL_UPDATE_SCALE = 72.0
-# A Both bad vote is a tie for legacy and exact-combination records, but it
-# does not assert that either side is relatively stronger. The Bayesian model
-# records absolute poor-output reliability evidence for every participant.
-TOP_SKILL_BOTH_BAD_PENALTY = 36.0
-TOP_SKILL_BOTH_BAD_SYNERGY_PENALTY = 18.0
 TOP_SKILL_SYNERGY_SIGMA = 140.0
-TOP_SKILL_SYNERGY_UPDATE_SCALE = 44.0
 TOP_TARGET_RANK = 50
-TOP_ELITE_RANK = 20
-TOP_SCREENING_MATCHES = 4
-TOP_QUALIFICATION_MATCHES = 8
-TOP_CONTENDER_MATCHES = 16
-TOP_ELITE_MIN_MATCHES = 12
 TOP_RETEST_MAX_MATCHES = 16
-TOP_ROTATE_PROBABILITY_THRESHOLD = 0.05
-TOP_DISCOVERY_RELEASE_THRESHOLD = 0.12
-TOP_RETEST_POTENTIAL_MARGIN = 60.0
-TOP_DISCOVERY_CYCLE_PROBABILITY = 0.22
-TOP_RETEST_ENTRY_PROBABILITY = 0.68
-MATCH_SCREENING_PROBABILITY = 0.25
-MATCH_GATEKEEPER_PROBABILITY = 0.30
-MATCH_CONTENDER_PROBABILITY = 0.25
-MATCH_ELITE_PROBABILITY = 0.15
-# Remaining 5% is broad exploration once broad coverage is complete.
-
-# Coverage-first discovery phase. It remains active until 90% of the complete
-# artist database has received at least one rated/tied evaluation. Completely
-# unseen artists occupy a fixed discovery reserve and are initially compared
-# solo against another unseen artist, allowing two new tags to enter the data
-# set in one duel. Promising candidates remain in the contender pool afterward.
-COVERAGE_TARGET_SEEN_FRACTION = 0.90
-COVERAGE_MIN_UNSEEN_ARTISTS = 250
-COVERAGE_UNSEEN_POOL_FRACTION = 0.45
-COVERAGE_SCREENING_PROBABILITY = 0.60
-COVERAGE_GATEKEEPER_PROBABILITY = 0.22
-COVERAGE_CONTENDER_PROBABILITY = 0.10
-COVERAGE_ELITE_PROBABILITY = 0.04
-# Remaining 4% is broad exploration.
-COVERAGE_FRESH_ENTRY_PROBABILITY = 0.94
-COVERAGE_MAX_ROTATIONS_PER_DUEL = 2
-# Startup/rebuild synchronization may fill the complete 45% unseen reserve at once.
-# Per-vote turnover remains capped separately by COVERAGE_MAX_ROTATIONS_PER_DUEL.
+# Startup/rebuild synchronization may fill the complete unseen reserve at once.
 COVERAGE_STARTUP_RESERVE_ADDITIONS = ACTIVE_POOL_SIZE
-COVERAGE_RELEASE_PROBABILITY_LIMIT = 0.60
-COVERAGE_RELEASE_POTENTIAL_MARGIN = 180.0
-# Newly evaluated fresh artists remain protected long enough to receive a fair
-# chance at a buffered gatekeeper/follow-up matchup, but not forever. Protection
-# ends early after their second completed evaluation.
-FRESH_FOLLOWUP_GRACE_RESULTS = 12
 
 # Periodically clean only this app's copied comparison images from Gradio's temp folder.
 GRADIO_TEMP_DIR = Path(tempfile.gettempdir()) / "gradio"
@@ -1457,14 +1450,6 @@ _runtime_cleanup_every_images = GRADIO_CLEANUP_EVERY_IMAGES
 _runtime_cleanup_oldest_entries = GRADIO_CLEANUP_OLDEST_ENTRIES
 
 # Phase 4 interface configuration.
-ARTIST_BROWSER_HEADERS = [
-    "#", "★", "Categories", "Artist", "Top score", "Potential", "μ ± σ", "Top-50 chance", "Stage",
-    "Legacy ELO", "Duels", "Record", "Score rate", "Weighted WR", "Confidence",
-    "Solo (ELO · WR · duels)", "Duo (ELO · WR · duels)", "Trio (ELO · WR · duels)",
-]
-COMBINATION_BROWSER_HEADERS = [
-    "#", "★", "Categories", "Artists", "Size", "Combination ELO", "Learned synergy", "Duels", "Record", "Score rate", "Weighted WR", "Confidence",
-]
 GALLERY_BROWSER_HEADERS = [
     "History #", "★", "Date", "Winner", "Matched side", "Artists A", "Artists B", "Match type", "Preset", "Seed", "Images",
 ]
@@ -3966,13 +3951,15 @@ class ArtistPortraitStore:
                     continue
                 portrait_path = str(value.get("portrait_path", "") or "")
                 if portrait_path and Path(portrait_path).exists():
-                    cleaned[str(artist)] = {
+                    entry = deepcopy(value)
+                    entry.update({
                         "artist": str(artist),
                         "portrait_path": portrait_path,
                         "source_path": str(value.get("source_path", "") or ""),
                         "history_number": int(value.get("history_number", 0) or 0),
                         "updated_at": float(value.get("updated_at", 0.0) or 0.0),
-                    }
+                    })
+                    cleaned[str(artist)] = entry
             with self.lock:
                 self.data = cleaned
                 self.version += 1
@@ -4040,10 +4027,25 @@ class ArtistPortraitStore:
             temp_path = destination.with_suffix(".tmp.jpg")
             cropped.save(temp_path, format="JPEG", quality=88, optimize=True)
             os.replace(temp_path, destination)
+        def file_digest(path: Path) -> str:
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
         entry = {
             "artist": artist,
             "portrait_path": str(destination),
+            "portrait_sha256": file_digest(destination),
             "source_path": str(source),
+            "source_sha256": file_digest(source),
+            "source_status": "available_at_creation",
+            "source_retention_may_remove_original": True,
+            "source_width": int(width),
+            "source_height": int(height),
+            "crop_x": crop_x,
+            "crop_y": crop_y,
+            "crop_size": crop_size,
             "history_number": int(history_number or 0),
             "updated_at": time.time(),
         }
@@ -4053,6 +4055,41 @@ class ArtistPortraitStore:
             self._data_url_cache.pop(artist, None)
         self.save()
         return deepcopy(entry)
+
+    def mark_source_retention(self, actions: Sequence[Any]) -> int:
+        """Keep portrait provenance accurate when retention moves/restores a source image."""
+        by_path: Dict[str, Any] = {}
+        for action in actions or []:
+            raw = str(getattr(action, "original_path", "") or "").strip()
+            if raw:
+                by_path[os.path.normcase(os.path.abspath(raw))] = action
+        if not by_path:
+            return 0
+        changed = 0
+        with self.lock:
+            for entry in self.data.values():
+                source = str(entry.get("source_path", "") or "").strip()
+                if not source:
+                    continue
+                action = by_path.get(os.path.normcase(os.path.abspath(source)))
+                if action is None:
+                    continue
+                status = str(getattr(action, "status", "") or "").casefold()
+                if status in {"quarantined", "removed", "purged"}:
+                    entry["source_status"] = "removed_by_retention"
+                    entry["source_removed_at"] = float(getattr(action, "acted_at", 0.0) or time.time())
+                elif status == "restored":
+                    entry["source_status"] = "available_after_retention_restore"
+                    entry.pop("source_removed_at", None)
+                else:
+                    continue
+                entry["updated_at"] = time.time()
+                changed += 1
+            if changed:
+                self.version += 1
+        if changed:
+            self.save()
+        return changed
 
     def remove(self, artist: str) -> bool:
         artist = str(artist or "").strip()
@@ -4740,6 +4777,20 @@ def load_storage_settings() -> dict:
         "orphan_min_age_days": 2,
         "matchmaking_mode": MATCHMAKING_MODE_COVERAGE,
         "record_generation_timing": False,
+        "update_channel": "stable",
+        "update_auto_check_enabled": False,
+        "update_auto_check_interval_hours": 24,
+        "update_last_check_epoch": 0.0,
+        "update_last_check_report": "",
+        "update_last_release_payload": "",
+        "backup_destination": "",
+        "backup_schedule_enabled": True,
+        "backup_metadata_interval_hours": 24,
+        "backup_complete_interval_days": 0,
+        "backup_retention_count": 10,
+        "backup_retention_max_gb": 0,
+        "backup_last_metadata_epoch": 0.0,
+        "backup_last_complete_epoch": 0.0,
         **DEFAULT_RETENTION_SETTINGS,
         "appearance_theme": normalize_theme_name(UI_THEME_DEFAULT),
         "custom_theme_mode": UI_CUSTOM_THEME_MODE,
@@ -5879,10 +5930,6 @@ ARTIST_GENERATION_COOLDOWN_MATCHES = 12
 MODEL_VERSION = 9
 
 
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
 def logistic(value: float) -> float:
     if value >= 0:
         z = math.exp(-value)
@@ -5891,24 +5938,8 @@ def logistic(value: float) -> float:
     return z / (1.0 + z)
 
 
-def atomic_write_json(path: Path, data: Any) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    with temp.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, ensure_ascii=False, indent=2)
-    temp.replace(path)
-
-
 def normalized_combo_id(artists: Sequence[str]) -> str:
     return " || ".join(sorted(str(a) for a in artists))
-
-
-def deterministic_synergy(artists: Sequence[str], seed: int, amplitude: float) -> float:
-    """Deterministic hidden synergy used by the simulator, not by live ranking."""
-    key = f"{seed}|{'|'.join(sorted(str(a) for a in artists))}"
-    rng = random.Random(key)
-    return rng.gauss(0.0, amplitude)
 
 
 @dataclass
@@ -8458,7 +8489,16 @@ class ArtistELORanker:
                 self.storage_settings.get(f"custom_theme_{key}"), fallback
             )
         save_storage_settings(self.storage_settings)
-        self.transfer_recovery = TransferRecoveryManager(PROGRAM_DIR, DATA_LAYOUT, SHAREABLE_EDITION_VERSION)
+        backup_destination = str(self.storage_settings.get("backup_destination", "") or "").strip()
+        self.transfer_recovery = TransferRecoveryManager(
+            PROGRAM_DIR,
+            DATA_LAYOUT,
+            SHAREABLE_EDITION_VERSION,
+            backup_root=Path(backup_destination) if backup_destination else None,
+            github_repository=GITHUB_REPOSITORY,
+        )
+        self.storage_settings["backup_destination"] = str(self.transfer_recovery.backup_root)
+        save_storage_settings(self.storage_settings)
         self.generation_timing_stats = GenerationTimingStats(GENERATION_TIMING_STATS_FILE)
 
         # Current/queued comparison state
@@ -8505,7 +8545,7 @@ class ArtistELORanker:
         # Phase 3 browser indexes are expensive to build from the complete history.
         # Cache them and only rebuild after the number of rated comparisons changes.
         self.browser_cache_lock = threading.RLock()
-        self.browser_cache_stamp: Optional[Tuple[int, int, int, int, int]] = None
+        self.browser_cache_stamp: Optional[Tuple[int, int, int, int, int, int]] = None
         self.artist_browser_records_cache: List[dict] = []
         self.combination_browser_records_cache: List[dict] = []
 
@@ -8771,10 +8811,7 @@ class ArtistELORanker:
         return f"**{count:,} artists match these filters.**"
 
     def create_manual_backup(self) -> Tuple[str, Optional[str]]:
-        """Create an immediate complete backup independent of the automatic cadence."""
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        path = BACKUP_DIR / f"artist_elo_manual_backup_{timestamp}.zip"
+        """Create an immediate portable metadata-and-portrait backup externally."""
         try:
             if not self.legacy_competitive_guard:
                 with self.persistence_write_lock:
@@ -8783,25 +8820,210 @@ class ArtistELORanker:
                         "pool", "classifications", "top50",
                     })
                 self._persist_runtime_state_now()
-            candidates = [
-                ELO_RATINGS_FILE, COMBINATION_RATINGS_FILE, TOP_SEARCH_RATINGS_FILE,
-                COMPARISON_HISTORY_FILE, ACTIVE_POOL_FILE, BUFFER_STATE_FILE,
-                MATCHMAKING_STATE_FILE, FAVORITES_FILE, CLASSIFICATION_TAGS_FILE,
-                ENTITY_NOTES_FILE, ARTIST_PORTRAITS_FILE, SAVED_PROMPTS_FILE,
-                STORAGE_SETTINGS_FILE, TOP50_ENTRY_FILE,
-            ]
-            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                archive.writestr("backup_manifest.json", json.dumps({
-                    "created_at": time.time(), "manual": True,
-                    "comparison_count": int(self.elo_system.comparison_count),
-                }, indent=2))
-                for candidate in candidates:
-                    if Path(candidate).exists():
-                        archive.write(candidate, arcname=Path(candidate).name)
-            return f"Created manual backup: `{path.name}`", str(path)
+            message, path = self.transfer_recovery.create_export("metadata", "Manual backup")
+            self.storage_settings["backup_last_metadata_epoch"] = time.time()
+            save_storage_settings(self.storage_settings)
+            return "Created portable metadata-and-portrait backup. " + message, str(path)
         except Exception as exc:
             self.last_error_details = f"Manual backup failed: {type(exc).__name__}: {exc}"
             return f"❌ Manual backup failed: {exc}", None
+
+    def backup_preview(self, mode: Any, destination: Any) -> str:
+        try:
+            text, _report = self.transfer_recovery.estimate_export(mode, destination)
+            return text
+        except Exception as exc:
+            return f"❌ Backup preview failed: {type(exc).__name__}: {exc}"
+
+    def save_backup_schedule(
+        self,
+        destination: Any,
+        enabled: Any,
+        metadata_hours: Any,
+        complete_days: Any,
+        retention_count: Any,
+        retention_max_gb: Any,
+    ) -> Tuple[str, str]:
+        try:
+            root = self.transfer_recovery.configure_backup_root(destination)
+            metadata_value = max(1.0, min(24.0 * 365.0, float(metadata_hours or 24)))
+            complete_value = max(0.0, min(3650.0, float(complete_days or 0)))
+            retention_value = max(1, min(100, int(retention_count or 10)))
+            retention_gb_value = max(0.0, min(100000.0, float(retention_max_gb or 0)))
+            self.storage_settings.update({
+                "backup_destination": str(root),
+                "backup_schedule_enabled": bool(enabled),
+                "backup_metadata_interval_hours": metadata_value,
+                "backup_complete_interval_days": complete_value,
+                "backup_retention_count": retention_value,
+                "backup_retention_max_gb": retention_gb_value,
+            })
+            save_storage_settings(self.storage_settings)
+            message = (
+                f"✅ Backup settings saved. Metadata/portraits: every {metadata_value:g} hour(s); "
+                f"complete media: {'off' if complete_value <= 0 else f'every {complete_value:g} day(s)'}; "
+                f"keep {retention_value} scheduled archive(s) per type; "
+                f"combined space cap: {'off' if retention_gb_value <= 0 else f'{retention_gb_value:g} GB'}.\n\n`{root}`"
+            )
+            return message, self.get_storage_dashboard(force=True)
+        except Exception as exc:
+            return f"❌ Could not save backup settings: {type(exc).__name__}: {exc}", self.get_storage_dashboard()
+
+    def _prune_scheduled_exports(self, marker: str) -> None:
+        keep = max(1, min(100, int(self.storage_settings.get("backup_retention_count", 10) or 10)))
+        matches = sorted(
+            self.transfer_recovery.exports_dir.glob(f"artist_ranker_*_*_Scheduled_{marker}.zip"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        remove = list(matches[keep:])
+        max_gb = max(0.0, float(self.storage_settings.get("backup_retention_max_gb", 0) or 0))
+        if max_gb > 0:
+            limit = int(max_gb * 1024 * 1024 * 1024)
+            retained_bytes = 0
+            # The UI exposes one space cap, so apply it across metadata and
+            # complete scheduled archives together. Count limits remain per type.
+            all_scheduled = sorted(
+                self.transfer_recovery.exports_dir.glob("artist_ranker_*_*_Scheduled_*.zip"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for path in all_scheduled:
+                if path in remove:
+                    continue
+                try:
+                    size = int(path.stat().st_size)
+                except OSError:
+                    size = 0
+                if retained_bytes + size > limit:
+                    remove.append(path)
+                else:
+                    retained_bytes += size
+        for old in set(remove):
+            old.unlink(missing_ok=True)
+
+    def _run_scheduled_backup_once(self) -> None:
+        if not bool(self.storage_settings.get("backup_schedule_enabled", True)):
+            return
+        now = time.time()
+        metadata_hours = max(1.0, float(self.storage_settings.get("backup_metadata_interval_hours", 24) or 24))
+        last_metadata = float(self.storage_settings.get("backup_last_metadata_epoch", 0.0) or 0.0)
+        if now - last_metadata >= metadata_hours * 3600.0:
+            self.transfer_recovery.create_export("metadata", "Scheduled_metadata")
+            self.storage_settings["backup_last_metadata_epoch"] = now
+            self._prune_scheduled_exports("metadata")
+            save_storage_settings(self.storage_settings)
+        complete_days = max(0.0, float(self.storage_settings.get("backup_complete_interval_days", 0) or 0))
+        last_complete = float(self.storage_settings.get("backup_last_complete_epoch", 0.0) or 0.0)
+        if complete_days > 0 and now - last_complete >= complete_days * 86400.0:
+            self.transfer_recovery.create_export("complete", "Scheduled_complete")
+            self.storage_settings["backup_last_complete_epoch"] = now
+            self._prune_scheduled_exports("complete")
+            save_storage_settings(self.storage_settings)
+
+    def version_status_markdown(self) -> str:
+        channel = str(self.storage_settings.get("update_channel", "stable") or "stable")
+        pending = (PROGRAM_DIR / ".artist_ranker_pending_update.json").exists()
+        last_check = float(self.storage_settings.get("update_last_check_epoch", 0.0) or 0.0)
+        last_check_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(last_check)) if last_check else "Never"
+        last_backup = max(
+            float(self.storage_settings.get("backup_last_metadata_epoch", 0.0) or 0.0),
+            float(self.storage_settings.get("backup_last_complete_epoch", 0.0) or 0.0),
+        )
+        backup_age_days = ((time.time() - last_backup) / 86400.0) if last_backup else None
+        backup_state = (
+            "Never verified"
+            if backup_age_days is None
+            else (f"{backup_age_days:.1f} days ago" + (" â€” backup recommended" if backup_age_days > 7 else ""))
+        )
+        return (
+            "### Installed components\n"
+            f"**Windows/server:** `{SHAREABLE_EDITION_VERSION}`  \n"
+            f"**Android package:** `{ANDROID_APP_VERSION}` (`{ANDROID_APP_VERSION_CODE}`)  \n"
+            f"**Pairing protocol:** `{PAIRING_PROTOCOL_VERSION}`  \n"
+            f"**Data schema:** `{DATA_SCHEMA_VERSION}` · **layout schema:** `{DATA_LAYOUT_SCHEMA_VERSION}`  \n"
+            f"**Update channel:** `{channel}`  \n"
+            f"**Last GitHub check:** `{last_check_text}`  \n"
+            f"**Last backup:** `{backup_state}`  \n"
+            f"**Scheduled update:** `{'Ready for restart' if pending else 'None'}`  \n"
+            f"**Program folder:** `{PROGRAM_DIR}`  \n"
+            f"**Data folder:** `{DATA_ROOT}`  \n"
+            f"**Backup folder:** `{self.transfer_recovery.backup_root}`"
+        )
+
+    def github_update_check(self, channel: Any) -> Tuple[str, str, str]:
+        normalized = "beta" if str(channel).casefold() == "beta" else "stable"
+        self.storage_settings["update_channel"] = normalized
+        save_storage_settings(self.storage_settings)
+        report, payload = self.transfer_recovery.github_release_status(normalized)
+        self.storage_settings["update_last_check_epoch"] = time.time()
+        self.storage_settings["update_last_check_report"] = report
+        self.storage_settings["update_last_release_payload"] = payload
+        save_storage_settings(self.storage_settings)
+        return report, payload, self.version_status_markdown()
+
+    def save_update_check_settings(self, channel: Any, enabled: Any, interval_hours: Any) -> Tuple[str, str]:
+        normalized = "beta" if str(channel).casefold() == "beta" else "stable"
+        try:
+            interval = max(1.0, min(24.0 * 30.0, float(interval_hours or 24)))
+        except (TypeError, ValueError):
+            interval = 24.0
+        self.storage_settings.update({
+            "update_channel": normalized,
+            "update_auto_check_enabled": bool(enabled),
+            "update_auto_check_interval_hours": interval,
+        })
+        save_storage_settings(self.storage_settings)
+        state = "enabled" if enabled else "disabled"
+        return f"âœ… Automatic GitHub checking is {state}; interval `{interval:g}` hour(s).", self.version_status_markdown()
+
+    def _run_automatic_update_check_once(self) -> None:
+        if not bool(self.storage_settings.get("update_auto_check_enabled", False)):
+            return
+        now = time.time()
+        interval = max(1.0, float(self.storage_settings.get("update_auto_check_interval_hours", 24) or 24))
+        last = float(self.storage_settings.get("update_last_check_epoch", 0.0) or 0.0)
+        if now - last < interval * 3600.0:
+            return
+        channel = str(self.storage_settings.get("update_channel", "stable") or "stable")
+        report, payload = self.transfer_recovery.github_release_status(channel)
+        self.storage_settings.update({
+            "update_last_check_epoch": now,
+            "update_last_check_report": report,
+            "update_last_release_payload": payload,
+        })
+        save_storage_settings(self.storage_settings)
+
+    def prepare_android_apk(self, source: Any, channel: Any, release_payload: Any) -> Tuple[str, Any]:
+        choice = str(source or "matching").casefold()
+        if choice == "matching":
+            if not ANDROID_APK_PATH.is_file():
+                return "❌ The matching Android APK is not present in this installation.", gr.update(value=None, visible=False)
+            return (
+                f"✅ Matching Android `{ANDROID_APP_VERSION}` APK is ready. Open the file control below to save it.",
+                gr.update(value=str(ANDROID_APK_PATH), visible=True),
+            )
+        payload = str(release_payload or "")
+        if not payload:
+            _report, payload = self.transfer_recovery.github_release_status(channel)
+        status, path = self.transfer_recovery.download_github_asset(payload, "apk")
+        return status, gr.update(value=str(path) if path else None, visible=bool(path))
+
+    def prepare_github_update(self, channel: Any, release_payload: Any) -> Tuple[str, Any, str, str, bool]:
+        payload = str(release_payload or "")
+        if not payload:
+            _report, payload = self.transfer_recovery.github_release_status(channel)
+        status, path = self.transfer_recovery.download_github_asset(payload, "update")
+        if not path:
+            return status, gr.update(value=None, visible=False), "", "", False
+        try:
+            preview, plan = self.transfer_recovery.preview_update(path)
+            return status, gr.update(value=str(path), visible=True), preview, plan, False
+        except Exception as exc:
+            return (
+                status + f"\n\n❌ Downloaded package could not be previewed: {type(exc).__name__}: {exc}",
+                gr.update(value=str(path), visible=True), "", "", False,
+            )
 
     @staticmethod
     def _sha256_file(path: Path) -> str:
@@ -9366,6 +9588,7 @@ class ArtistELORanker:
                 old_backup.unlink(missing_ok=True)
             print(f"Created automatic backup: {backup_path}")
         except Exception as e:
+            backup_path.unlink(missing_ok=True)
             print(f"Warning: Could not create automatic backup: {e}")
 
     def get_session(self) -> ApiCredential:
@@ -9375,7 +9598,7 @@ class ArtistELORanker:
             if not api_key:
                 self.api_key_configured = False
                 raise ValueError(
-                    "NovelAI API key is not configured. Open Storage / Settings on "
+                    "NovelAI API key is not configured. Open Maintenance on "
                     "this PC at http://127.0.0.1 and save a persistent API token."
                 )
             self.api_key_configured = True
@@ -9799,7 +10022,7 @@ class ArtistELORanker:
         """Start sequential background refill if the rolling buffer is below target."""
         if not self.api_key_configured:
             self.last_generation_error = (
-                "NovelAI API key not configured. Open Storage / Settings locally to continue."
+                "NovelAI API key not configured. Open Maintenance locally to continue."
             )
             return
         # The refill worker can hold state_lock while selecting/generating. Most
@@ -13822,7 +14045,7 @@ class ArtistELORanker:
             lambda path: bool(re.fullmatch(r"compare_\d+_\d+_[ab]\.png", path.name)),
         )
         thumb_count, thumb_bytes = self._scan_directory(THUMBNAIL_DIR)
-        backup_count, backup_bytes = self._scan_directory(BACKUP_DIR)
+        backup_count, backup_bytes = self._scan_directory(self.transfer_recovery.backup_root)
         quarantine = self.retention_manager.quarantine_summary()
         retention_settings = normalize_retention_settings(self.storage_settings)
         temp_count = 0
@@ -13868,7 +14091,8 @@ class ArtistELORanker:
             f"**Retention recovery quarantine:** {quarantine['count']:,} files — {readable_size(quarantine['bytes'])}  ",
             f"**Gallery thumbnails:** {thumb_count:,} files — {readable_size(thumb_bytes)}  ",
             f"**App-specific Gradio cache:** {temp_count:,} entries — {readable_size(temp_bytes)}  ",
-            f"**Automatic backups:** {backup_count:,} files — {readable_size(backup_bytes)}  ",
+            f"**Backup compartment:** `{self.transfer_recovery.backup_root}`  ",
+            f"**Backup files:** {backup_count:,} files — {readable_size(backup_bytes)}  ",
             f"**Rated history:** {history_count:,} duels  ",
             f"**Currently buffered:** {buffered:,} duels  ",
             f"**Matchmaking strategy:** {matchmaking_summary}  ",
@@ -14283,6 +14507,7 @@ class ArtistELORanker:
                     record[f"image_{side}_purged_at"] = float(action.acted_at or time.time())
                     record.pop(f"image_{side}_quarantine_path", None)
                     changed += 1
+        portrait_sources_changed = self.artist_portraits.mark_source_retention(actions)
         if changed:
             with self.gallery_cache_lock:
                 self.gallery_cache_stamp = None
@@ -14290,7 +14515,7 @@ class ArtistELORanker:
                 self.storage_cache_time = 0.0
                 self.storage_cache_markdown = ""
             self._schedule_persistence(sections={"history"})
-        return changed
+        return changed + portrait_sources_changed
 
     def _execute_retention_plan(self, plan: RetentionPlan) -> RetentionResult:
         result = self.retention_manager.execute_plan(
@@ -14408,8 +14633,10 @@ class ArtistELORanker:
         while not self.retention_worker_stop.wait(60.0):
             try:
                 self._run_automatic_retention_once()
+                self._run_scheduled_backup_once()
+                self._run_automatic_update_check_once()
             except Exception as exc:
-                self.last_error_details = f"Retention worker: {type(exc).__name__}: {exc}"
+                self.last_error_details = f"Maintenance worker: {type(exc).__name__}: {exc}"
 
     def _stop_retention_worker(self) -> None:
         try:
@@ -14557,7 +14784,8 @@ class ArtistELORanker:
         except Exception:
             free_text = "Unknown"
             disk_ok = False
-        backup_count = len(list(BACKUP_DIR.glob("*.zip"))) if BACKUP_DIR.exists() else 0
+        backup_root = self.transfer_recovery.backup_root
+        backup_count = len(list(backup_root.rglob("*.zip"))) if backup_root.exists() else 0
         apk_ready = ANDROID_APK_PATH.exists()
         paired_count = len([device for device in PHONE_PAIRING.list_devices() if not device.get("revoked")])
         complete = bool(self.storage_settings.get("first_run_complete", False))
@@ -14572,14 +14800,19 @@ class ArtistELORanker:
             f"{check(self.api_key_configured)} API key: `{'Configured' if self.api_key_configured else 'Not configured'}`  \n"
             f"{check(artist_count > 0)} Artist list: `{artist_count:,} artists`  \n"
             f"{check(disk_ok)} Free space at data location: `{free_text}`  \n"
+            f"✅ Program folder: `{PROGRAM_DIR}`  \n"
             f"✅ Data mode: `{DATA_LAYOUT.active_layout.mode}` — `{DATA_LAYOUT.active_layout.root}`  \n"
+            f"✅ External backup folder: `{backup_root}`  \n"
             f"✅ Ranker port: `{SERVER_PORT}` is active  \n"
             f"{check(apk_ready)} Android package: `{'Ready' if apk_ready else 'Not installed'}`  \n"
             f"{check(paired_count > 0)} Paired phones: `{paired_count}`  \n"
             f"{check(backup_count > 0)} Backups found: `{backup_count}`  \n"
             f"✅ Image-retention choice: `{policy}`  \n"
             f"**LAN address:** `{lan_text}`  \n"
-            "Create or revoke phone access under **Storage / Settings → Phone pairing and LAN security**."
+            "For a simple setup, keep the current Data and backup folders. For a custom/advanced setup, use "
+            "**Data location and migration safety** and **Backup destination and schedule** below; an existing Data "
+            "folder can be selected in place without deleting it. Create or revoke phone access under "
+            "**Maintenance → Phone pairing and LAN security**."
         )
 
     def complete_first_run_setup(self, retention_policy: str) -> Tuple[str, str, Optional[str]]:
@@ -15665,11 +15898,22 @@ class ArtistELORanker:
                         favorites_remove_btn = gr.Button("Remove selected favorite", variant="stop")
                     favorites_status = gr.Markdown("")
 
-                with gr.Tab("Storage / Settings", id="storage") as storage_tab:
-                    gr.Markdown("## Storage and cleanup")
+                with gr.Tab("Maintenance", id="storage") as storage_tab:
+                    gr.Markdown("## Maintenance Center")
                     gr.Markdown(
-                        "Storage scans run only when requested and are cached briefly, so this tab does not slow "
-                        "image generation or ranking browsers."
+                        "Updates, backups, data location, phone setup, integrity checks, and cleanup live here. "
+                        "Low-frequency behavior and display preferences have moved to the main **Settings** panel. "
+                        "The floating Help button can be restored either here or in Settings."
+                    )
+                    version_status = gr.Markdown(self.version_status_markdown(), elem_id="phase9-version-status")
+                    help_button_visible_setting = gr.Checkbox(
+                        label="Show floating Help button on this device [?]",
+                        value=True,
+                        elem_id="show-floating-help-button-setting",
+                        info=(
+                            "Turn this on to restore the floating Help button. This preference is stored in the "
+                            "current browser or Android app and is also available under Settings → Maintenance preferences."
+                        ),
                     )
 
                     # SHAREABLE_EDITION_SECURE_CONFIGURATION_V192_UI
@@ -15755,7 +15999,7 @@ class ArtistELORanker:
                         first_run_backup_file = gr.File(label="Initial setup backup", visible=False)
 
                     # SHAREABLE_EDITION_DATA_FOUNDATION_V180_UI
-                    with gr.Accordion("Data location and migration safety", open=True):
+                    with gr.Accordion("Data location and migration safety", open=False):
                         data_layout_status = gr.Markdown(DATA_LAYOUT.status_markdown())
                         gr.Markdown(
                             "Choose where mutable ranker data should live. Existing installations stay in the "
@@ -15811,7 +16055,7 @@ class ArtistELORanker:
                     storage_manual_backup_status = gr.Markdown("")
                     storage_manual_backup_file = gr.File(label="Manual backup", visible=False)
 
-                    with gr.Accordion("Android app", open=True):
+                    with gr.Accordion("Android app", open=False):
                         android_apk_state = (
                             "APK ready to download." if ANDROID_APK_PATH.exists()
                             else "APK file is not installed yet. Re-run the Android patch installer."
@@ -15823,9 +16067,23 @@ class ArtistELORanker:
                             "Android will show its normal package installation confirmation. "
                             "The ranker cannot silently install the app."
                         )
+                        android_apk_source = gr.Radio(
+                            choices=[
+                                (f"Matching this server — Android {ANDROID_APP_VERSION}", "matching"),
+                                ("Latest published GitHub APK", "latest"),
+                            ],
+                            value="matching",
+                            label="APK to download",
+                        )
+                        android_apk_prepare_btn = gr.Button("Prepare APK download", variant="primary")
+                        android_apk_download_status = gr.Markdown(
+                            "**Phone tip:** open this ranker in your phone browser and use the same download control there. "
+                            "The APK will download directly to the phone; Android will ask you to approve installation."
+                        )
+                        android_apk_download_file = gr.File(label="Android APK", visible=False)
 
 
-                    with gr.Accordion("Phone pairing and LAN security", open=True):
+                    with gr.Accordion("Phone pairing and LAN security", open=False):
                         gr.HTML(PHONE_PAIRING_PANEL_HTML, elem_id="phone-pairing-admin-host")
 
                     gr.HTML(
@@ -15850,7 +16108,7 @@ class ArtistELORanker:
                     generation_timing_status = gr.State("")
 
                     # PERMANENT_GLOBAL_DUEL_DIAGNOSTICS_V1_UI
-                    with gr.Accordion("Full duel diagnostics", open=False):
+                    with gr.Accordion("Diagnostics and support", open=False):
                         gr.Markdown(
                             "Enable this only while reproducing slow or missed duel inputs. When disabled, "
                             "profiling and browser tracing are bypassed. When enabled, the log records the physical "
@@ -15865,6 +16123,19 @@ class ArtistELORanker:
                             ),
                             value=GLOBAL_DUEL_DIAGNOSTICS.enabled,
                             elem_id="full-diagnostics-enabled",
+                            visible=False,
+                        )
+                        gr.Markdown(
+                            "Detailed tracing moved to **Settings → Maintenance preferences**. Diagnostic ZIPs "
+                            "redact API-looking secrets, usernames, and local folder roots."
+                        )
+                        diagnostics_preview = gr.Markdown(
+                            "**Bundle preview:** README, redacted summary/environment, thread stacks, rotating logs, "
+                            "optional boot diagnostics, and redacted source snapshots. Rankings and generated images are excluded."
+                        )
+                        diagnostics_export_confirm = gr.Checkbox(
+                            label="I reviewed these contents and want to create the redacted diagnostic ZIP",
+                            value=False,
                         )
                         diagnostics_status = gr.Markdown(GLOBAL_DUEL_DIAGNOSTICS.status_markdown())
                         with gr.Row():
@@ -15932,7 +16203,7 @@ class ArtistELORanker:
                         reset_competitive_status = gr.Markdown("")
                         reset_backup_file = gr.File(label="Mandatory pre-reset backup", visible=False)
 
-                    with gr.Accordion("Matchmaking strategy", open=True):
+                    with gr.Accordion("Matchmaking strategy bridge", open=False, visible=False):
                         gr.Markdown(
                             "**Coverage** is the default. It explores broadly through 80% coverage, then "
                             "smoothly tapers toward Top-100/Top-50 selection. **Selection** immediately "
@@ -15949,6 +16220,7 @@ class ArtistELORanker:
                                 "matchmaking_mode", MATCHMAKING_MODE_COVERAGE
                             ),
                             label="Generation priority [?]",
+                            elem_id="maintenance-matchmaking-mode",
                             info=(
                                 "Coverage explores broadly and automatically shifts toward Top-100/Top-50 refinement after 80% coverage. Selection immediately emphasizes contender positioning while retaining a small discovery budget."
                             ),
@@ -15957,7 +16229,7 @@ class ArtistELORanker:
                             self.matchmaking_mode_status()
                         )
 
-                    with gr.Accordion("Full-resolution image retention", open=True):
+                    with gr.Accordion("Full-resolution image retention", open=False):
                         gr.HTML(
                             '<div class="retention-intro-card">'
                             '<strong>Safe managed cleanup</strong><span>History and ranking data are always preserved. '
@@ -16060,22 +16332,49 @@ class ArtistELORanker:
                         )
 
                     # SHAREABLE_EDITION_PHASE7_BACKUP_TRANSFER_RECOVERY_UI
-                    with gr.Accordion("Backup, transfer, recovery, and updates", open=True):
+                    with gr.Accordion("Backup, transfer, recovery, and updates", open=False):
                         gr.Markdown(
                             "Every import, restore, migration, or update is previewed and checksum-verified. "
                             "Destructive operations create a restore point first and use a recovery journal so an interrupted write can be rolled back on startup."
                         )
-                        help_button_visible_setting = gr.Checkbox(
-                            label="Show floating Help button on this device [?]",
-                            value=True,
-                            elem_id="show-floating-help-button-setting",
-                            info=(
-                                "This is stored in the current browser or Android app, not globally. The Help center remains reachable "
-                                "from Settings or the Android app menu after the floating button is hidden."
-                            ),
-                        )
+                        with gr.Accordion("Backup destination and schedule", open=False):
+                            backup_destination = gr.Textbox(
+                                label="External backup folder",
+                                value=str(self.transfer_recovery.backup_root),
+                                info="Must be outside both Program and active Data so a backup cannot include itself.",
+                            )
+                            backup_schedule_enabled = gr.Checkbox(
+                                label="Enable scheduled backups",
+                                value=bool(self.storage_settings.get("backup_schedule_enabled", True)),
+                            )
+                            with gr.Row():
+                                backup_metadata_hours = gr.Number(
+                                    label="Metadata + portraits every N hours",
+                                    value=self.storage_settings.get("backup_metadata_interval_hours", 24),
+                                    minimum=1,
+                                )
+                                backup_complete_days = gr.Number(
+                                    label="Complete media backup every N days (0 = off)",
+                                    value=self.storage_settings.get("backup_complete_interval_days", 0),
+                                    minimum=0,
+                                )
+                                backup_retention_count = gr.Number(
+                                    label="Keep scheduled backups per type",
+                                    value=self.storage_settings.get("backup_retention_count", 10),
+                                    minimum=1,
+                                    precision=0,
+                                )
+                                backup_retention_max_gb = gr.Number(
+                                    label="Scheduled-backup space cap in GB (0 = off)",
+                                    value=self.storage_settings.get("backup_retention_max_gb", 0),
+                                    minimum=0,
+                                )
+                            backup_schedule_save_btn = gr.Button("Save backup destination and schedule", variant="primary")
+                            backup_schedule_status = gr.Markdown(
+                                "Complete-media scheduling is off by default because generated-image libraries can be extremely large."
+                            )
 
-                        with gr.Accordion("Export or transfer a profile", open=True):
+                        with gr.Accordion("Export or transfer a profile", open=False):
                             transfer_export_mode = gr.Radio(
                                 choices=[(spec["label"], mode) for mode, spec in EXPORT_MODES.items()],
                                 value="metadata",
@@ -16085,7 +16384,9 @@ class ArtistELORanker:
                                 label="Optional export label",
                                 placeholder="For example: Laptop transfer or Before new artist list",
                             )
-                            transfer_export_btn = gr.Button("Create validated export ZIP", variant="primary")
+                            with gr.Row():
+                                transfer_export_preview_btn = gr.Button("Preview size and free space")
+                                transfer_export_btn = gr.Button("Create validated export ZIP", variant="primary")
                             transfer_export_status = gr.Markdown(
                                 "Credentials, pairing tokens, keystores, environment files, caches, and toolchains are always excluded."
                             )
@@ -16136,6 +16437,14 @@ class ArtistELORanker:
                             with gr.Row():
                                 recovery_refresh_btn = gr.Button("Refresh restore points")
                                 recovery_integrity_btn = gr.Button("Run data-integrity check")
+                            recovery_integrity_level = gr.Radio(
+                                choices=[
+                                    ("Standard — metadata, references, and media counts", "standard"),
+                                    ("Deep — also hash media and CRC-check recent backups", "deep"),
+                                ],
+                                value="standard",
+                                label="Integrity-check depth",
+                            )
                             recovery_restore_table = gr.Markdown(self.transfer_recovery.restore_points_markdown())
                             recovery_integrity_report = gr.Markdown(
                                 self.transfer_recovery.startup_report or "No interrupted operation was detected at startup."
@@ -16152,15 +16461,37 @@ class ArtistELORanker:
                                 "Update packages are inspected before scheduling. The next startup applies only checksum-listed files, "
                                 "after a complete program/metadata restore point has been created. A failed application rolls back changed files."
                             )
-                            update_feed_url = gr.Textbox(
-                                label="Optional JSON release-feed URL",
-                                value=str(self.storage_settings.get("update_feed_url", "") or ""),
-                                placeholder="https://example.invalid/artist-ranker/releases.json",
+                            update_channel = gr.Radio(
+                                choices=[("Stable releases", "stable"), ("Beta / prerelease", "beta")],
+                                value=str(self.storage_settings.get("update_channel", "stable") or "stable"),
+                                label="Update channel",
                             )
-                            update_feed_check_btn = gr.Button("Check release feed")
+                            with gr.Row():
+                                update_auto_check = gr.Checkbox(
+                                    label="Automatically check GitHub for updates",
+                                    value=bool(self.storage_settings.get("update_auto_check_enabled", False)),
+                                )
+                                update_auto_check_hours = gr.Number(
+                                    label="Check every N hours",
+                                    value=self.storage_settings.get("update_auto_check_interval_hours", 24),
+                                    minimum=1,
+                                )
+                                update_check_settings_btn = gr.Button("Save update-check settings")
+                            with gr.Row():
+                                update_feed_check_btn = gr.Button("Check GitHub for updates", variant="primary")
+                                update_download_btn = gr.Button("Download verified Windows update")
                             update_feed_report = gr.Markdown(
-                                "No official feed is hard-coded. You can use a trusted feed or preview a local update ZIP below."
+                                str(self.storage_settings.get("update_last_check_report", "") or (
+                                    f"Updates are checked against [{GITHUB_REPOSITORY}](https://github.com/{GITHUB_REPOSITORY}/releases). "
+                                    "No GitHub account or token is required. Automatic checking is optional and off by default."
+                                ))
                             )
+                            update_release_payload = gr.Textbox(
+                                value=str(self.storage_settings.get("update_last_release_payload", "") or ""),
+                                visible=False,
+                                elem_classes=["legacy-hidden-editor"],
+                            )
+                            update_download_status = gr.Markdown("")
                             update_package_file = gr.File(
                                 label="Artist Ranker update ZIP", file_types=[".zip"], type="filepath"
                             )
@@ -16174,7 +16505,7 @@ class ArtistELORanker:
                             update_schedule_btn = gr.Button("Create restore point and schedule update", variant="primary")
                             update_status = gr.Markdown("")
 
-                    with gr.Accordion("Automatic Gradio cache cleanup", open=True):
+                    with gr.Accordion("Temporary cache cleanup", open=False):
                         with gr.Row():
                             storage_cleanup_every = gr.Number(
                                 label="Run cleanup every N generated images [?]",
@@ -16184,6 +16515,8 @@ class ArtistELORanker:
                                 value=self.storage_settings.get("cleanup_every_images", 50),
                                 minimum=1,
                                 precision=0,
+                                elem_id="maintenance-cleanup-every",
+                                visible=False,
                             )
                             storage_cleanup_oldest = gr.Number(
                                 label="Delete N oldest app cache entries [?]",
@@ -16193,6 +16526,8 @@ class ArtistELORanker:
                                 value=self.storage_settings.get("cleanup_oldest_entries", 25),
                                 minimum=1,
                                 precision=0,
+                                elem_id="maintenance-cleanup-oldest",
+                                visible=False,
                             )
                             storage_orphan_age = gr.Number(
                                 label="Orphan scan minimum age in days [?]",
@@ -16201,9 +16536,17 @@ class ArtistELORanker:
                                 ),
                                 value=self.storage_settings.get("orphan_min_age_days", 2),
                                 minimum=0,
+                                elem_id="maintenance-orphan-age",
+                                visible=False,
                             )
-                        storage_save_settings_btn = gr.Button("Save cleanup settings")
+                        storage_save_settings_btn = gr.Button(
+                            "Save cleanup settings", elem_id="maintenance-cleanup-save", visible=False
+                        )
                         storage_settings_status = gr.Markdown("")
+                        gr.Markdown(
+                            "Automatic cache frequency and orphan age moved to **Settings → Maintenance preferences**. "
+                            "The controls below perform immediate cleanup only."
+                        )
                         with gr.Row():
                             storage_manual_temp_count = gr.Number(
                                 label="Manual temp cleanup entries [?]",
@@ -16286,12 +16629,21 @@ class ArtistELORanker:
             ]
 
             # Phase 7 backup, transfer, recovery, and update callbacks.
-            def on_transfer_export(mode, label):
+            def on_transfer_export(mode, label, destination):
                 try:
+                    self.transfer_recovery.configure_backup_root(destination)
                     report, path = self.transfer_recovery.create_export(mode, label)
                     return report, gr.update(value=str(path), visible=True)
                 except Exception as exc:
                     return f"❌ Export failed: {type(exc).__name__}: {exc}", gr.update(value=None, visible=False)
+
+            def on_transfer_export_preview(mode, destination):
+                return self.backup_preview(mode, destination)
+
+            def on_backup_schedule_save(destination, enabled, metadata_hours, complete_days, retention_count, retention_max_gb):
+                return self.save_backup_schedule(
+                    destination, enabled, metadata_hours, complete_days, retention_count, retention_max_gb
+                )
 
             def on_transfer_import_preview(upload):
                 try:
@@ -16326,18 +16678,24 @@ class ArtistELORanker:
                 rows = self.transfer_recovery.list_restore_points()
                 return gr.update(choices=[row["name"] for row in rows], value=None), self.transfer_recovery.restore_points_markdown()
 
-            def on_recovery_integrity():
-                report, _details = self.transfer_recovery.validate_integrity()
+            def on_recovery_integrity(level):
+                report, _details = self.transfer_recovery.validate_integrity(str(level) == "deep")
                 return report
 
             def on_recovery_restore(selected, confirmed):
                 return self.transfer_recovery.restore_selected(selected, confirmed), False
 
-            def on_update_feed_check(url):
-                with self.state_lock:
-                    self.storage_settings["update_feed_url"] = str(url or "").strip()
-                    save_storage_settings(self.storage_settings)
-                return self.transfer_recovery.check_release_feed(url)
+            def on_update_feed_check(channel):
+                return self.github_update_check(channel)
+
+            def on_update_check_settings(channel, enabled, interval_hours):
+                return self.save_update_check_settings(channel, enabled, interval_hours)
+
+            def on_update_download(channel, release_payload):
+                return self.prepare_github_update(channel, release_payload)
+
+            def on_android_apk_prepare(source, channel, release_payload):
+                return self.prepare_android_apk(source, channel, release_payload)
 
             def on_update_preview(upload):
                 try:
@@ -17645,7 +18003,14 @@ class ArtistELORanker:
                 message = GLOBAL_DUEL_DIAGNOSTICS.clear()
                 return message + "\n\n" + GLOBAL_DUEL_DIAGNOSTICS.status_markdown(), GLOBAL_DUEL_DIAGNOSTICS.latest_json()
 
-            def on_diagnostics_export():
+            def on_diagnostics_export(confirmed):
+                if not bool(confirmed):
+                    return (
+                        GLOBAL_DUEL_DIAGNOSTICS.status_markdown()
+                        + "  \nReview the bundle preview and enable the confirmation first.",
+                        gr.update(visible=False),
+                        GLOBAL_DUEL_DIAGNOSTICS.latest_json(),
+                    )
                 try:
                     path = GLOBAL_DUEL_DIAGNOSTICS.export_bundle(self)
                     return (
@@ -18435,6 +18800,7 @@ class ArtistELORanker:
             )
             diagnostics_export_btn.click(
                 fn=on_diagnostics_export,
+                inputs=[diagnostics_export_confirm],
                 outputs=[diagnostics_status, diagnostics_export_file, diagnostics_latest],
                 show_progress="full",
             )
@@ -18599,8 +18965,23 @@ class ArtistELORanker:
 
             transfer_export_btn.click(
                 fn=on_transfer_export,
-                inputs=[transfer_export_mode, transfer_export_label],
+                inputs=[transfer_export_mode, transfer_export_label, backup_destination],
                 outputs=[transfer_export_status, transfer_export_file],
+                show_progress="full",
+            )
+            transfer_export_preview_btn.click(
+                fn=on_transfer_export_preview,
+                inputs=[transfer_export_mode, backup_destination],
+                outputs=[transfer_export_status],
+                show_progress="full",
+            )
+            backup_schedule_save_btn.click(
+                fn=on_backup_schedule_save,
+                inputs=[
+                    backup_destination, backup_schedule_enabled, backup_metadata_hours,
+                    backup_complete_days, backup_retention_count, backup_retention_max_gb,
+                ],
+                outputs=[backup_schedule_status, storage_dashboard],
                 show_progress="full",
             )
             transfer_import_preview_btn.click(
@@ -18628,6 +19009,7 @@ class ArtistELORanker:
             )
             recovery_integrity_btn.click(
                 fn=on_recovery_integrity,
+                inputs=[recovery_integrity_level],
                 outputs=[recovery_integrity_report],
                 show_progress="full",
             )
@@ -18639,8 +19021,26 @@ class ArtistELORanker:
             )
             update_feed_check_btn.click(
                 fn=on_update_feed_check,
-                inputs=[update_feed_url],
-                outputs=[update_feed_report],
+                inputs=[update_channel],
+                outputs=[update_feed_report, update_release_payload, version_status],
+                show_progress="full",
+            )
+            update_check_settings_btn.click(
+                fn=on_update_check_settings,
+                inputs=[update_channel, update_auto_check, update_auto_check_hours],
+                outputs=[update_download_status, version_status],
+                show_progress="hidden",
+            )
+            update_download_btn.click(
+                fn=on_update_download,
+                inputs=[update_channel, update_release_payload],
+                outputs=[update_download_status, update_package_file, update_preview_report, update_plan, update_confirm],
+                show_progress="full",
+            )
+            android_apk_prepare_btn.click(
+                fn=on_android_apk_prepare,
+                inputs=[android_apk_source, update_channel, update_release_payload],
+                outputs=[android_apk_download_status, android_apk_download_file],
                 show_progress="full",
             )
             update_preview_btn.click(
@@ -21056,6 +21456,17 @@ GALLERY_ARTIST_PICKER_JS = r"""
     const catalogInput = catalogRoot.matches('input,textarea') ? catalogRoot : catalogRoot.querySelector('input,textarea');
     if (!native || !catalogInput) { window.setTimeout(install, 120); return; }
 
+    const previous = window.__artistEloGalleryArtistPickerLifecycle;
+    if (previous) {
+      window.clearInterval(previous.timer);
+      document.removeEventListener('click', previous.documentClick);
+      window.removeEventListener('resize', previous.resize);
+      window.removeEventListener('scroll', previous.scroll, true);
+      previous.native?.removeEventListener('input', previous.syncFromNative);
+      previous.native?.removeEventListener('change', previous.syncFromNative);
+      window.__artistEloGalleryArtistPickerLifecycle = null;
+    }
+
     let artists = [];
     try {
       const parsed = JSON.parse(catalogInput.value || '[]');
@@ -21244,13 +21655,16 @@ GALLERY_ARTIST_PICKER_JS = r"""
     });
     prev.addEventListener('click', event => { event.stopPropagation(); page -= 1; renderResults(); });
     next.addEventListener('click', event => { event.stopPropagation(); page += 1; renderResults(); });
-    document.addEventListener('click', event => {
+    const documentClick = event => {
       if (!picker.contains(event.target) && !popover.contains(event.target)) close();
-    });
-    window.addEventListener('resize', positionPopover, {passive:true});
-    window.addEventListener('scroll', () => {
+    };
+    const resize = () => positionPopover();
+    const scroll = () => {
       if (popover.classList.contains('is-open')) positionPopover();
-    }, {passive:true, capture:true});
+    };
+    document.addEventListener('click', documentClick);
+    window.addEventListener('resize', resize, {passive:true});
+    window.addEventListener('scroll', scroll, {passive:true, capture:true});
 
     const syncFromNative = () => {
       const value = native.value || '';
@@ -21262,7 +21676,10 @@ GALLERY_ARTIST_PICKER_JS = r"""
     };
     native.addEventListener('input', syncFromNative);
     native.addEventListener('change', syncFromNative);
-    window.setInterval(syncFromNative, 350);
+    const timer = window.setInterval(syncFromNative, 350);
+    window.__artistEloGalleryArtistPickerLifecycle = {
+      timer, documentClick, resize, scroll, native, syncFromNative,
+    };
     syncFromNative();
     renderResults();
     window.__artistEloGalleryArtistPickerInstalled = true;
@@ -23058,11 +23475,22 @@ ArtistELORanker.qol_report_bad_image = _qol_report_bad_image
 
 # ANDROID_WEBVIEW_APP_AND_DUEL_ARTIST_ACTIONS_V1
 # DEDICATED_DUEL_UX_AND_FULL_RANKER_ACTION_REPAIR_V2
-ANDROID_APP_VERSION = "1.4.1"
-ANDROID_APP_VERSION_CODE = 10
+ANDROID_APP_VERSION = "1.5.1"
+ANDROID_APP_VERSION_CODE = 12
 ANDROID_APK_FILENAME = "artist-ranker.apk"
 ANDROID_DOWNLOADS_DIR = SCRIPT_DIR / "downloads"
-ANDROID_APK_PATH = ANDROID_DOWNLOADS_DIR / ANDROID_APK_FILENAME
+ANDROID_APK_PATH = next(
+    (
+        candidate.resolve()
+        for candidate in (
+            ANDROID_DOWNLOADS_DIR / ANDROID_APK_FILENAME,
+            SCRIPT_DIR.parent / ANDROID_APK_FILENAME,
+            SCRIPT_DIR / ANDROID_APK_FILENAME,
+        )
+        if candidate.is_file()
+    ),
+    (ANDROID_DOWNLOADS_DIR / ANDROID_APK_FILENAME).resolve(),
+)
 
 
 # DEDICATED_DUEL_PAGE_RANKER_REPAIR_V4
@@ -23082,15 +23510,11 @@ DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace(
 ).replace(
     '              <button class="image-action-trigger" type="button" data-side-menu="B" aria-label="Image B actions">⋯</button>\n', ''
 )
-DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace('artist-elo-duel-v8', 'artist-elo-duel-v9')
-
 # SECURE_PHONE_PAIRING_CLIENT_V220
 DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace("</head>", '<style id="artist-ranker-pairing-style">\n  #pairingOverlay{position:fixed;inset:0;z-index:2147483600;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(4,7,11,.84);backdrop-filter:blur(10px)}\n  #pairingOverlay.open{display:flex}\n  .pairing-card{width:min(520px,100%);max-height:min(760px,calc(100vh - 28px));overflow:auto;border:1px solid rgba(255,255,255,.12);border-radius:22px;background:#151a22;color:#eef3fb;box-shadow:0 30px 100px rgba(0,0,0,.55);padding:20px}\n  .pairing-title{font-size:1.35rem;font-weight:850}.pairing-subtitle{margin-top:5px;color:#9aa8bc;line-height:1.42}\n  .pairing-server{margin:14px 0;padding:11px 12px;border:1px solid rgba(112,168,255,.22);border-radius:13px;background:rgba(112,168,255,.08)}\n  .pairing-server strong{display:block}.pairing-server span{display:block;margin-top:3px;color:#9aa8bc;font-size:.8rem}\n  .pairing-label{display:block;margin:13px 0 6px;font-size:.78rem;font-weight:780;color:#cbd6e7}\n  .pairing-code-row,.pairing-address-row{display:flex;gap:8px}.pairing-code-row input,.pairing-address-row input{min-width:0;flex:1 1 auto;border:1px solid rgba(255,255,255,.13);border-radius:12px;background:#0e131a;color:#eef3fb;padding:11px 12px}\n  .pairing-code-row input{text-transform:uppercase;letter-spacing:.15em;font-weight:820;text-align:center}\n  .pairing-card button{min-height:42px;border:1px solid rgba(255,255,255,.13);border-radius:12px;background:#222b3a;color:#eef3fb;padding:9px 13px;font-weight:780;cursor:pointer}\n  .pairing-card button.primary{background:#70a8ff;color:#08101b;border-color:#70a8ff}.pairing-card button.danger{color:#ff9696}.pairing-card button:disabled{opacity:.5;cursor:wait}\n  .pairing-status{min-height:1.35em;margin-top:12px;color:#9aa8bc;font-size:.82rem;line-height:1.4}.pairing-status.error{color:#ff9999}.pairing-status.success{color:#76e9a1}\n  .pairing-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}.pairing-actions button{flex:1 1 130px}\n  .pairing-divider{height:1px;background:rgba(255,255,255,.08);margin:16px 0}\n  .pairing-hint{margin-top:9px;color:#8190a5;font-size:.74rem;line-height:1.42}\n  body.pairing-required .page,body.pairing-required #galleryPage,body.pairing-required #generationPage,body.pairing-required #artistLadderPage{filter:blur(3px);pointer-events:none;user-select:none}\n  @media(max-width:520px){.pairing-card{padding:16px;border-radius:18px}.pairing-code-row,.pairing-address-row{flex-direction:column}.pairing-card button{width:100%}}\n</style>\n' + "</head>", 1)
-DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace("<body>", "<body>" + '<div id="pairingOverlay" role="dialog" aria-modal="true" aria-labelledby="pairingTitle">\n  <section class="pairing-card">\n    <div class="pairing-title" id="pairingTitle">Pair this device</div>\n    <div class="pairing-subtitle" id="pairingSubtitle">This ranker accepts only paired devices on the local network.</div>\n    <div class="pairing-server"><strong id="pairingServerName">Artist Ranker</strong><span id="pairingServerDetails">Checking server compatibility…</span></div>\n    <div id="pairingCodeSection">\n      <label class="pairing-label" for="pairingCodeInput">One-use pairing code</label>\n      <div class="pairing-code-row"><input id="pairingCodeInput" maxlength="7" autocomplete="one-time-code" inputmode="text" placeholder="ABC123"><button class="primary" id="pairingSubmit" type="button">Pair</button></div>\n      <div class="pairing-hint">Create the code on the ranker PC under Storage / Settings → Phone pairing and LAN security, or scan its QR code.</div>\n    </div>\n    <div class="pairing-divider"></div>\n    <label class="pairing-label" for="pairingServerInput">Manual server address</label>\n    <div class="pairing-address-row"><input id="pairingServerInput" autocomplete="url" placeholder="192.168.1.20:7860"><button id="pairingOpenServer" type="button">Open server</button></div>\n    <div class="pairing-status" id="pairingStatus"></div>\n    <div class="pairing-actions"><button id="pairingClose" type="button">Close</button><button id="pairingForget" class="danger" type="button">Forget this server</button><button id="pairingReload" type="button">Reload</button></div>\n  </section>\n</div>\n', 1)
+DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace("<body>", "<body>" + '<div id="pairingOverlay" role="dialog" aria-modal="true" aria-labelledby="pairingTitle">\n  <section class="pairing-card">\n    <div class="pairing-title" id="pairingTitle">Pair this device</div>\n    <div class="pairing-subtitle" id="pairingSubtitle">This ranker accepts only paired devices on the local network.</div>\n    <div class="pairing-server"><strong id="pairingServerName">Artist Ranker</strong><span id="pairingServerDetails">Checking server compatibility…</span></div>\n    <div id="pairingCodeSection">\n      <label class="pairing-label" for="pairingCodeInput">One-use pairing code</label>\n      <div class="pairing-code-row"><input id="pairingCodeInput" maxlength="7" autocomplete="one-time-code" inputmode="text" placeholder="ABC123"><button class="primary" id="pairingSubmit" type="button">Pair</button></div>\n      <div class="pairing-hint">Create the code on the ranker PC under Maintenance → Phone pairing and LAN security. Scanning its QR opens the installed Android app directly.</div>\n    </div>\n    <div class="pairing-divider"></div>\n    <label class="pairing-label" for="pairingServerInput">Manual server address</label>\n    <div class="pairing-address-row"><input id="pairingServerInput" autocomplete="url" placeholder="192.168.1.20:7860"><button id="pairingOpenServer" type="button">Open server</button></div>\n    <div class="pairing-status" id="pairingStatus"></div>\n    <div class="pairing-actions"><button id="pairingClose" type="button">Close</button><button id="pairingForget" class="danger" type="button">Forget this server</button><button id="pairingReload" type="button">Reload</button></div>\n  </section>\n</div>\n', 1)
 DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace("</body>", '<script id="artist-ranker-pairing-client">\n(() => {\n  if (window.__artistRankerPairingClientV220) return;\n  window.__artistRankerPairingClientV220 = true;\n  const PROTOCOL=1;\n  const SERVER_STORAGE_KEY="artistRanker.rememberedServer";\n  const byId=id=>document.getElementById(id);\n  const state={required:false,paired:false,handshake:null,opening:false};\n  const originalFetch=window.fetch.bind(window);\n  const isProtectedUrl=input=>{try{const url=new URL(typeof input===\'string\'?input:input?.url||\'\',location.href);return url.origin===location.origin&&(url.pathname.startsWith(\'/api/duel/\')||url.pathname.startsWith(\'/ranker/\')||url.pathname.startsWith(\'/api/generation-analytics\'));}catch{return false}};\n  const showStatus=(message=\'\',kind=\'\')=>{const node=byId(\'pairingStatus\');if(!node)return;node.textContent=message;node.className=\'pairing-status\'+(kind?` ${kind}`:\'\')};\n  const showOverlay=(required=false,message=\'\')=>{const overlay=byId(\'pairingOverlay\');if(!overlay)return;state.required=!!required;overlay.classList.add(\'open\');document.body.classList.toggle(\'pairing-required\',state.required);byId(\'pairingClose\').hidden=state.required;if(message)showStatus(message,\'error\');};\n  const hideOverlay=()=>{if(state.required)return;byId(\'pairingOverlay\')?.classList.remove(\'open\');document.body.classList.remove(\'pairing-required\')};\n  window.__artistRankerShowPairing=()=>showOverlay(false,\'\');\n  window.fetch=async (...args)=>{const response=await originalFetch(...args);if(response.status===401&&isProtectedUrl(args[0])){let body={};try{body=await response.clone().json()}catch{}showOverlay(true,body.detail||\'Pair this device with the ranker PC before continuing.\')}else if(response.status===426&&isProtectedUrl(args[0])){showOverlay(true,\'This app and server are not protocol-compatible. Update the older side.\')}return response};\n  const normalizeServer=value=>{let text=String(value||\'\').trim();if(!text)return\'\';if(!/^https?:\\/\\//i.test(text))text=\'http://\'+text;text=text.replace(/\\/+$/,\'\');try{const url=new URL(text);return `${url.protocol}//${url.host}/duel?source=android-app`}catch{return\'\'}};\n  const deviceName=()=>{const platform=navigator.userAgentData?.platform||navigator.platform||\'Device\';return `Artist Ranker on ${platform}`.slice(0,80)};\n  async function handshake(){try{const r=await originalFetch(`/api/pairing/handshake?protocol=${PROTOCOL}`,{cache:\'no-store\'});const body=await r.json();state.handshake=body;byId(\'pairingServerName\').textContent=body.server_name||\'Artist Ranker\';byId(\'pairingServerDetails\').textContent=`Server ${body.server_version||\'?\'} · protocol ${body.protocol_current||\'?\'} · ${body.client_mode===\'multi_client\'?\'multi-client\':\'single active voting device\'}`;if(!body.compatible){showOverlay(true,body.compatibility_message||\'App/server update required.\')}return body}catch(error){byId(\'pairingServerDetails\').textContent=\'Server handshake unavailable\';return null}}\n  async function session(){try{const r=await originalFetch(\'/api/pairing/session\',{cache:\'no-store\'});if(!r.ok)return null;const body=await r.json();state.paired=!!body.authorized;if(state.paired){byId(\'pairingSubtitle\').textContent=`Paired as ${body.device_name||\'this device\'}.`;byId(\'pairingCodeSection\').hidden=true;byId(\'pairingForget\').hidden=false;}return body}catch{return null}}\n  async function exchange(code){const normalized=String(code||\'\').toUpperCase().replace(/[^A-Z0-9]/g,\'\');if(normalized.length!==6){showStatus(\'Enter the six-character code shown on the PC.\',\'error\');return false}const button=byId(\'pairingSubmit\');button.disabled=true;showStatus(\'Pairing…\');try{const r=await originalFetch(\'/api/pairing/exchange\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({code:normalized,device_name:deviceName(),protocol:PROTOCOL})});let body={};try{body=await r.json()}catch{}if(!r.ok)throw new Error(body.detail||`HTTP ${r.status}`);state.required=false;state.paired=true;showStatus(\'Paired successfully. Opening Duel…\',\'success\');const url=new URL(location.href);url.searchParams.delete(\'pair\');history.replaceState({},\'\',url.pathname+url.search+url.hash);setTimeout(()=>location.reload(),350);return true}catch(error){showStatus(error.message||String(error),\'error\');return false}finally{button.disabled=false}}\n  async function forget(){const button=byId(\'pairingForget\');button.disabled=true;try{await originalFetch(\'/api/pairing/forget\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:\'{}\'});}catch{}try{localStorage.removeItem(SERVER_STORAGE_KEY)}catch{}state.paired=false;state.required=true;byId(\'pairingCodeSection\').hidden=false;byId(\'pairingSubtitle\').textContent=\'This device has been forgotten. Enter a new one-use code to pair again.\';showOverlay(true,\'Pairing removed.\');button.disabled=false}\n  function installConnectionButton(){const actions=document.querySelector(\'.top-actions\');if(!actions||byId(\'connectionBtn\'))return;const button=document.createElement(\'button\');button.id=\'connectionBtn\';button.className=\'pill-btn\';button.type=\'button\';button.textContent=\'Connection\';button.addEventListener(\'click\',async()=>{await session();showOverlay(false,\'\')});actions.prepend(button)}\n  function wire(){byId(\'pairingSubmit\')?.addEventListener(\'click\',()=>exchange(byId(\'pairingCodeInput\').value));byId(\'pairingCodeInput\')?.addEventListener(\'keydown\',event=>{if(event.key===\'Enter\')exchange(event.currentTarget.value)});byId(\'pairingOpenServer\')?.addEventListener(\'click\',()=>{const target=normalizeServer(byId(\'pairingServerInput\').value);if(!target){showStatus(\'Enter a hostname or IP address, optionally followed by the port.\',\'error\');return}try{localStorage.setItem(SERVER_STORAGE_KEY,target)}catch{}location.href=target});byId(\'pairingForget\')?.addEventListener(\'click\',forget);byId(\'pairingReload\')?.addEventListener(\'click\',()=>location.reload());byId(\'pairingClose\')?.addEventListener(\'click\',hideOverlay);installConnectionButton()}\n  async function start(){wire();try{const remembered=localStorage.getItem(SERVER_STORAGE_KEY)||"";if(remembered)byId("pairingServerInput").value=new URL(remembered).host}catch{}await handshake();const params=new URLSearchParams(location.search);const code=params.get(\'pair\');if(code){showOverlay(true,\'Pairing link detected.\');byId(\'pairingCodeInput\').value=code;await exchange(code);return}const current=await session();if(!current?.authorized){showOverlay(true,\'Enter a code from the ranker PC or scan its QR code.\')}}\n  if(document.readyState===\'loading\')document.addEventListener(\'DOMContentLoaded\',start,{once:true});else start();\n})();\n</script>\n' + "</body>", 1)
-DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace("artist-elo-duel-v6", "artist-elo-duel-v7")
 DEDICATED_DUEL_PAGE_HTML = enhance_dedicated_duel_html(DEDICATED_DUEL_PAGE_HTML)
-DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace("artist-elo-duel-v7", "artist-elo-duel-v8")
 
 DEDICATED_RANKER_MOUNT_SAFETY_CSS = r"""
 /* Dedicated-page mount safety: internal transport controls must never be user-visible. */
@@ -23912,7 +24336,7 @@ def launch_with_dedicated_duel_page(ranker, gradio_app):
             },
             {
                 "id": "first_run", "ok": first_run_complete, "label": "First-run setup",
-                "detail": "Completed." if first_run_complete else "Needs attention in Storage / Settings.",
+                "detail": "Completed." if first_run_complete else "Needs attention in Maintenance.",
             },
             {
                 "id": "retention", "ok": True, "label": "Original-image retention",
@@ -23947,6 +24371,19 @@ def launch_with_dedicated_duel_page(ranker, gradio_app):
         except Exception:
             pass
         return list(dict.fromkeys(urls))
+
+    def _pairing_app_link(item: dict) -> str:
+        browser_link = str(item.get("primary_link", "") or "")
+        if not browser_link:
+            return ""
+        parsed = urllib.parse.urlsplit(browser_link)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        server = f"{parsed.scheme}://{parsed.netloc}"
+        return "artist-ranker://pair?" + urllib.parse.urlencode({
+            "server": server,
+            "code": str(item.get("code", "") or ""),
+        })
 
     @server.get("/api/pairing/handshake")
     async def pairing_handshake(protocol: Optional[int] = Query(None)):
@@ -24024,6 +24461,7 @@ def launch_with_dedicated_duel_page(ranker, gradio_app):
         item = PHONE_PAIRING.issue_code(_pairing_base_urls(request))
         return JSONResponse({
             **item,
+            "app_link": _pairing_app_link(item),
             "qr_url": f"/api/pairing/admin/qr?code={item['code']}",
         }, headers={"Cache-Control": "no-store"})
 
@@ -24036,7 +24474,7 @@ def launch_with_dedicated_duel_page(ranker, gradio_app):
             raise HTTPException(status_code=404, detail="Pairing code expired or was already used.")
         try:
             import qrcode
-            image = qrcode.make(str(item["primary_link"]))
+            image = qrcode.make(_pairing_app_link(item) or str(item["primary_link"]))
             stream = io.BytesIO()
             image.save(stream, format="PNG")
         except Exception as exc:
@@ -24127,11 +24565,12 @@ def launch_with_dedicated_duel_page(ranker, gradio_app):
     @server.get("/duel/sw.js")
     async def dedicated_pwa_service_worker():
         from fastapi.responses import Response
-        script = r"""const CACHE='artist-elo-duel-v7';
+        script = r"""const CACHE='artist-elo-duel-v8';
 const SHELL=['/duel','/duel/manifest.webmanifest','/duel/icon-192.png','/duel/icon-512.png'];
+const SHELL_PATHS=new Set(SHELL);
 self.addEventListener('install',event=>{event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(SHELL)).then(()=>self.skipWaiting()));});
 self.addEventListener('activate',event=>{event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(key=>key!==CACHE).map(key=>caches.delete(key)))).then(()=>self.clients.claim()));});
-self.addEventListener('fetch',event=>{const url=new URL(event.request.url);if(event.request.method!=='GET'||url.origin!==location.origin)return;if(url.pathname.startsWith('/api/duel/')||url.pathname.startsWith('/ranker/'))return;event.respondWith(fetch(event.request).then(response=>{const copy=response.clone();caches.open(CACHE).then(cache=>cache.put(event.request,copy));return response;}).catch(()=>caches.match(event.request).then(match=>match||caches.match('/duel'))));});"""
+self.addEventListener('fetch',event=>{const url=new URL(event.request.url);if(event.request.method!=='GET'||url.origin!==location.origin||!SHELL_PATHS.has(url.pathname))return;const cacheKey=url.pathname;event.respondWith(fetch(event.request).then(response=>{if(response.ok)caches.open(CACHE).then(cache=>cache.put(cacheKey,response.clone()));return response;}).catch(()=>caches.match(cacheKey)));});"""
         return Response(script, media_type="application/javascript", headers={"Service-Worker-Allowed": "/duel", "Cache-Control": "no-cache"})
 
     @server.get("/gradio_api/file={file_path:path}")
@@ -24661,13 +25100,14 @@ self.addEventListener('fetch',event=>{const url=new URL(event.request.url);if(ev
         path="/ranker",
         server_name=LAN_SERVER_HOST,
         server_port=SERVER_PORT,
+        ssr_mode=False,
         theme=gr.themes.Soft(),
         css=PHASE3_CSS + str(globals().get("QOL_ACCELERATOR_CSS", "")) + DEDICATED_RANKER_MOUNT_SAFETY_CSS + SECURE_SETUP_CSS + PHONE_PAIRING_CSS + FULL_RANKER_V5_CSS + FULL_RANKER_GUIDANCE_CSS,
         head=(
             CONTEXT_UI_HEAD + GALLERY_DUEL_UI_HEAD + SOUND_UI_HEAD
             + GALLERY_ARTIST_PICKER_HEAD + APPEARANCE_THEME_HEAD + POLISH_UI_HEAD
             + ARTIST_CONTROLS_HEAD + QOL_UI_HEAD + BOOLEAN_PAGINATION_HEAD
-            + DIAGNOSTICS_HEAD + GENERATION_ANALYTICS_HEAD + SECURE_SETUP_HEAD + PHONE_PAIRING_HEAD
+            + DIAGNOSTICS_HEAD + GENERATION_ANALYTICS_HEAD + SECURE_SETUP_HEAD + PHONE_PAIRING_HEAD + PHASE9_SETTINGS_HEAD
             + str(globals().get("QOL_ACCELERATOR_HEAD", "")) + DEDICATED_NAV_BRIDGE_HEAD + FULL_RANKER_V5_HEAD + FULL_RANKER_GUIDANCE_HEAD
         ),
         allowed_paths=[str(COMPARISON_IMAGES_DIR)],
@@ -24736,7 +25176,6 @@ def main():
     print(f"Buffer state file: {BUFFER_STATE_FILE}")
     print(f"Combination ratings file: {COMBINATION_RATINGS_FILE}")
     print(f"Top-search ratings file: {TOP_SEARCH_RATINGS_FILE}")
-    print(f"Automatic backups: {BACKUP_DIR}")
     print(f"Classification tags: {CLASSIFICATION_TAGS_FILE}")
     print(f"Entity notes: {ENTITY_NOTES_FILE}")
     print(f"Artist portraits: {ARTIST_PORTRAITS_FILE}")
@@ -24759,6 +25198,7 @@ def main():
     gr.set_static_paths([COMPARISON_IMAGES_DIR])
 
     ranker = ArtistELORanker()
+    print(f"Backup compartment: {ranker.transfer_recovery.backup_root}")
     app = ranker.create_ui()
 
     launch_with_dedicated_duel_page(ranker, app)

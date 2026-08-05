@@ -1,7 +1,8 @@
-# NovelAI Artist Ranker 2.5.3
+# NovelAI Artist Ranker 2.6.0
 
-- Complete exports now use portable artist-portrait and source-image references.
-- Restoring either a new export or a legacy 2.5.2 export relocates portrait metadata to the active Data folder.
-- The normal Windows launcher again displays live server logs and stops the ranker when its console window is closed.
-- The background system-tray launcher remains available as an optional alternative.
-- Repository, application, user data, backups, and private build assets now have documented separation.
+- Setup can install on D: or another chosen drive and remembers that Program location.
+- Real GitHub update checks, verified Windows update packages, stable/beta channels, and optional automatic checks.
+- External scheduled backups, size/free-space previews, count/space retention, deep integrity audits, and portrait provenance.
+- A streamlined Maintenance Center with low-frequency preferences moved into Settings.
+- Safer redacted diagnostic bundles and a last-200-lines sanitized log command.
+- Android 1.5.1 handles `artist-ranker://pair` QR links, authenticates the buffer monitor, and can download the matching or latest verified APK.

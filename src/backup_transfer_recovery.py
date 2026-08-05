@@ -18,15 +18,20 @@ import tempfile
 import threading
 import time
 import urllib.request
+import urllib.error
+import urllib.parse
 import uuid
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 TRANSFER_SCHEMA_VERSION = 1
 PORTABLE_MEDIA_REFERENCE_VERSION = 1
 UPDATE_SCHEMA_VERSION = 1
+DEFAULT_GITHUB_REPOSITORY = "SeaBassBand/NovelAI-Artist-Ranker"
+GITHUB_API_ROOT = "https://api.github.com"
 MAX_ARCHIVE_MEMBERS = 600_000
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_SINGLE_METADATA_BYTES = 2 * 1024 * 1024 * 1024
@@ -38,8 +43,10 @@ EXCLUDED_NAMES = {
 EXCLUDED_SUFFIXES = {".jks", ".keystore", ".p12", ".pfx", ".key", ".pem"}
 EXCLUDED_PARTS = {
     "venv", ".git", "__pycache__", ".gradle", "gradle-cache", "toolchain",
-    "diagnostics", "retention_quarantine", ".migration-staging",
+    "diagnostics", "retention_quarantine", ".migration-staging", ".duel_previews",
 }
+EXCLUDED_NAME_FOLDS = frozenset(name.casefold() for name in EXCLUDED_NAMES)
+EXCLUDED_PART_FOLDS = frozenset(part.casefold() for part in EXCLUDED_PARTS)
 
 RANKING_KEYS = (
     "elo_ratings_file", "comparison_history_file", "active_pool_file",
@@ -88,6 +95,25 @@ def _atomic_write_json(path: Path, data: Any) -> None:
         temp.unlink(missing_ok=True)
 
 
+@contextmanager
+def _atomic_zip_writer(destination: Path):
+    """Publish only a completely closed ZIP and always remove partial output."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.partial")
+    try:
+        with zipfile.ZipFile(
+            partial,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            allowZip64=True,
+        ) as archive:
+            yield archive
+        os.replace(partial, destination)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
 def _sha256_path(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -98,6 +124,37 @@ def _sha256_path(path: Path) -> str:
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _path_identity(path: Path) -> str:
+    """Return a case-aware absolute identity without touching the filesystem.
+
+    ``Path.resolve()`` asks Windows to resolve every path component.  Integrity
+    audits may contain tens of thousands of deliberately removed historical
+    images, so doing that for every missing reference is needlessly expensive.
+    ``abspath`` preserves the identity comparison we need while avoiding those
+    filesystem round trips.
+    """
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _write_file_with_hash(
+    archive: zipfile.ZipFile,
+    source: Path,
+    arcname: str,
+) -> Tuple[int, str]:
+    """Stream a file into a ZIP while hashing the same bytes in one disk pass."""
+    source = Path(source)
+    info = zipfile.ZipInfo.from_file(source, arcname=str(arcname))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    digest = hashlib.sha256()
+    size = 0
+    with source.open("rb") as input_file, archive.open(info, "w", force_zip64=True) as output_file:
+        for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+            output_file.write(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
 
 
 def _format_bytes(value: int) -> str:
@@ -150,9 +207,9 @@ def _zip_member_is_symlink(info: zipfile.ZipInfo) -> bool:
 
 def _is_sensitive(path: Path) -> bool:
     lowered = {part.casefold() for part in path.parts}
-    if lowered & {part.casefold() for part in EXCLUDED_PARTS}:
+    if lowered & EXCLUDED_PART_FOLDS:
         return True
-    if path.name.casefold() in {name.casefold() for name in EXCLUDED_NAMES}:
+    if path.name.casefold() in EXCLUDED_NAME_FOLDS:
         return True
     return path.suffix.casefold() in EXCLUDED_SUFFIXES
 
@@ -166,7 +223,7 @@ def _iter_files(path: Path) -> Iterable[Path]:
             yield path
         return
     for root, dirs, files in os.walk(path):
-        dirs[:] = [name for name in dirs if name.casefold() not in {p.casefold() for p in EXCLUDED_PARTS}]
+        dirs[:] = [name for name in dirs if name.casefold() not in EXCLUDED_PART_FOLDS]
         for name in files:
             child = Path(root) / name
             if not _is_sensitive(child) and not child.is_symlink():
@@ -282,14 +339,23 @@ class ArchivePlan:
 
 
 class TransferRecoveryManager:
-    def __init__(self, program_dir: Path, data_layout: Any, app_version: str):
+    def __init__(
+        self,
+        program_dir: Path,
+        data_layout: Any,
+        app_version: str,
+        backup_root: Optional[Path] = None,
+        github_repository: str = DEFAULT_GITHUB_REPOSITORY,
+    ):
         self.program_dir = Path(program_dir).resolve()
         self.data_layout = data_layout
         self.app_version = str(app_version)
         self.data_root = Path(data_layout.active_layout.root).resolve()
         self.root = self.data_root / "recovery"
-        self.exports_dir = self.root / "exports"
-        self.restore_points_dir = self.root / "restore_points"
+        self.github_repository = str(github_repository or DEFAULT_GITHUB_REPOSITORY).strip(" /")
+        self.backup_root = Path(backup_root).expanduser().resolve() if backup_root else self.default_backup_root()
+        self.exports_dir = self.backup_root / "exports"
+        self.restore_points_dir = self.backup_root / "restore_points"
         self.import_staging_dir = self.root / "import_staging"
         self.update_staging_dir = self.root / "update_staging"
         self.journal_file = self.root / "operation_journal.json"
@@ -299,6 +365,64 @@ class TransferRecoveryManager:
         for directory in (self.root, self.exports_dir, self.restore_points_dir, self.import_staging_dir, self.update_staging_dir):
             directory.mkdir(parents=True, exist_ok=True)
         self.startup_report = self._recover_interrupted_operation()
+
+    def default_backup_root(self) -> Path:
+        """Return a separate backup compartment beside the active data compartment."""
+        parent = self.data_root.parent
+        if parent.name.casefold() == "storage":
+            return (parent / "Backups" / "NovelAI-Artist-Ranker").resolve()
+        return (parent / "NovelAI-Artist-Ranker-Backups").resolve()
+
+    def configure_backup_root(self, value: Any) -> Path:
+        candidate = Path(str(value or self.default_backup_root())).expanduser().resolve()
+        for blocked, label in ((self.data_root, "active Data"), (self.program_dir, "Program")):
+            blocked = blocked.resolve()
+            if candidate == blocked or blocked in candidate.parents:
+                raise ValueError(f"The backup destination cannot be inside the {label} folder.")
+        candidate.mkdir(parents=True, exist_ok=True)
+        self.backup_root = candidate
+        self.exports_dir = candidate / "exports"
+        self.restore_points_dir = candidate / "restore_points"
+        self.exports_dir.mkdir(parents=True, exist_ok=True)
+        self.restore_points_dir.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def estimate_export(self, mode: str, destination_root: Any = None) -> Tuple[str, dict]:
+        mode = str(mode or "metadata")
+        if mode not in EXPORT_MODES:
+            raise ValueError("Choose a valid export mode.")
+        root = self.configure_backup_root(destination_root) if destination_root else self.backup_root
+        files = 0
+        total = 0
+        seen: set[Path] = set()
+        for _key, source in self._logical_sources(mode):
+            for child in _iter_files(source):
+                resolved = child.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                try:
+                    total += int(child.stat().st_size)
+                    files += 1
+                except OSError:
+                    continue
+        free = int(shutil.disk_usage(root).free)
+        # Deflate output varies heavily for PNG/JPG data. Requiring the full source
+        # size plus a small staging margin is conservative and easy to understand.
+        required = total + min(max(512 * 1024 * 1024, total // 20), 4 * 1024 * 1024 * 1024)
+        enough = free >= required
+        report = {
+            "mode": mode, "files": files, "source_bytes": total,
+            "free_bytes": free, "required_bytes": required, "enough_space": enough,
+            "destination": str(root),
+        }
+        text = (
+            f"### Backup preview\n**Contents:** {EXPORT_MODES[mode]['label']}  \n"
+            f"**Files:** {files:,}  \n**Source size:** {_format_bytes(total)}  \n"
+            f"**Destination:** `{root}`  \n**Free space:** {_format_bytes(free)}  \n"
+            f"**Space check:** {'✅ Ready' if enough else '❌ Not enough free space for a safe export'}"
+        )
+        return text, report
 
     def _path_for_key(self, key: str) -> Path:
         return Path(self.data_layout.path(key)).resolve()
@@ -343,7 +467,7 @@ class TransferRecoveryManager:
         entries: List[dict] = []
         seen: set[str] = set()
         portable_references = 0
-        with self._lock, zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+        with self._lock, _atomic_zip_writer(destination) as archive:
             for key, source in self._logical_sources(mode):
                 if not source.exists():
                     continue
@@ -367,9 +491,7 @@ class TransferRecoveryManager:
                         digest = _sha256_bytes(payload)
                         archive.writestr(arc_text, payload)
                     else:
-                        size = int(child.stat().st_size)
-                        digest = _sha256_path(child)
-                        archive.write(child, arcname=arc_text)
+                        size, digest = _write_file_with_hash(archive, child, arc_text)
                     entries.append({
                         "logical_key": key,
                         "relative_path": relative.as_posix(),
@@ -514,7 +636,7 @@ class TransferRecoveryManager:
         destination = self.restore_points_dir / f"restore_{stamp}_{safe}_{uuid.uuid4().hex[:6]}.zip"
         entries: List[dict] = []
         sources = self._logical_sources("complete" if include_images else "metadata")
-        with self._lock, zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+        with self._lock, _atomic_zip_writer(destination) as archive:
             for key, source in sources:
                 if not source.exists():
                     continue
@@ -522,22 +644,22 @@ class TransferRecoveryManager:
                 for child in _iter_files(source):
                     relative = child.relative_to(root) if source.is_dir() else Path(child.name)
                     arc = (Path("data") / key / relative).as_posix()
-                    archive.write(child, arcname=arc)
-                    entries.append({"scope":"data","logical_key":key,"relative_path":relative.as_posix(),"archive_path":arc,"size":int(child.stat().st_size),"sha256":_sha256_path(child)})
+                    size, digest = _write_file_with_hash(archive, child, arc)
+                    entries.append({"scope":"data","logical_key":key,"relative_path":relative.as_posix(),"archive_path":arc,"size":size,"sha256":digest})
             if include_program:
                 for name in PROGRAM_BACKUP_NAMES:
                     child = self.program_dir / name
                     if child.is_file() and not _is_sensitive(child):
                         arc = (Path("program") / name).as_posix()
-                        archive.write(child, arcname=arc)
-                        entries.append({"scope":"program","relative_path":name,"archive_path":arc,"size":int(child.stat().st_size),"sha256":_sha256_path(child)})
+                        size, digest = _write_file_with_hash(archive, child, arc)
+                        entries.append({"scope":"program","relative_path":name,"archive_path":arc,"size":size,"sha256":digest})
                 for relative_dir in PROGRAM_BACKUP_DIRS:
                     directory = self.program_dir / relative_dir
                     for child in _iter_files(directory):
                         relative = child.relative_to(self.program_dir)
                         arc = (Path("program") / relative).as_posix()
-                        archive.write(child, arcname=arc)
-                        entries.append({"scope":"program","relative_path":relative.as_posix(),"archive_path":arc,"size":int(child.stat().st_size),"sha256":_sha256_path(child)})
+                        size, digest = _write_file_with_hash(archive, child, arc)
+                        entries.append({"scope":"program","relative_path":relative.as_posix(),"archive_path":arc,"size":size,"sha256":digest})
             manifest = self._archive_manifest(kind="restore_point", mode="complete" if include_images else "metadata", entries=entries, label=label)
             manifest["includes_program"] = bool(include_program)
             manifest["includes_images"] = bool(include_images)
@@ -788,9 +910,12 @@ class TransferRecoveryManager:
                     )
             return f"❌ Import failed: {type(exc).__name__}: {exc}.{rollback_note}".replace("..", ".")
 
-    def validate_integrity(self) -> Tuple[str, dict]:
+    def validate_integrity(self, deep: bool = False) -> Tuple[str, dict]:
+        """Audit metadata, managed media, portrait provenance, and recent backups."""
         issues: List[str] = []
+        warnings: List[str] = []
         checked = 0
+        json_documents: Dict[str, Any] = {}
         for key in METADATA_KEYS:
             try:
                 path = self._path_for_key(key)
@@ -801,17 +926,212 @@ class TransferRecoveryManager:
             checked += 1
             if path.suffix.casefold() == ".json":
                 try:
-                    json.loads(path.read_text(encoding="utf-8"))
+                    json_documents[key] = json.loads(path.read_text(encoding="utf-8"))
                 except Exception as exc:
                     issues.append(f"{key}: invalid JSON — {exc}")
+
+        media_counts: Dict[str, int] = {}
+        for key in MEDIA_KEYS:
+            try:
+                root = self._path_for_key(key)
+            except Exception:
+                continue
+            count = 0
+            if root.is_dir():
+                for child in _iter_files(root):
+                    count += 1
+                    if deep:
+                        try:
+                            _sha256_path(child)
+                        except Exception as exc:
+                            issues.append(f"{key}: unreadable `{child.name}` — {exc}")
+            media_counts[key] = count
+
+        portraits = json_documents.get("artist_portraits_file", {})
+        portrait_missing = 0
+        source_missing = 0
+        referenced_portraits: set[str] = set()
+        if isinstance(portraits, dict):
+            for artist, entry in portraits.items():
+                if not isinstance(entry, dict):
+                    issues.append(f"artist_portraits_file: invalid entry for {artist!r}")
+                    continue
+                portrait_text = str(entry.get("portrait_path", "") or "").strip()
+                portrait = Path(portrait_text) if portrait_text else None
+                if portrait is not None:
+                    referenced_portraits.add(_path_identity(portrait))
+                if portrait is None or not portrait.is_file():
+                    portrait_missing += 1
+                    issues.append(f"Portrait image is missing for {artist!r}: `{portrait_text or 'not recorded'}`")
+                source_text = str(entry.get("source_path", "") or "").strip()
+                if source_text and not Path(source_text).is_file():
+                    source_missing += 1
+        portrait_orphans = 0
+        try:
+            portrait_root = self._path_for_key("artist_portraits_dir")
+            for child in _iter_files(portrait_root):
+                if _path_identity(child) not in referenced_portraits:
+                    portrait_orphans += 1
+        except Exception:
+            pass
+        if source_missing:
+            warnings.append(
+                f"{source_missing:,} portrait source image(s) were removed by normal full-resolution retention; "
+                "their saved portrait JPGs remain valid."
+            )
+        if portrait_orphans:
+            warnings.append(f"{portrait_orphans:,} unreferenced portrait image file(s) were found.")
+
+        # Cross-check duel history, retention markers, favorites, and comparison media.
+        history = json_documents.get("comparison_history_file", [])
+        history_records = history if isinstance(history, list) else []
+        if history is not None and not isinstance(history, list):
+            issues.append("comparison_history_file: expected a JSON list of duel records")
+        history_references: set[str] = set()
+        history_missing = 0
+        history_retention_missing = 0
+        for index, record in enumerate(history_records):
+            if not isinstance(record, dict):
+                if len(issues) < 100:
+                    issues.append(f"comparison_history_file: duel {index + 1:,} is not an object")
+                continue
+            for side in ("a", "b"):
+                raw = str(record.get(f"image_{side}_path", "") or "").strip()
+                if not raw:
+                    continue
+                path = Path(raw)
+                history_references.add(_path_identity(path))
+                if path.is_file():
+                    continue
+                retained = record.get(f"image_{side}_retained")
+                status = str(record.get(f"image_{side}_retention_status", "") or "").casefold()
+                if retained is False or status in {"removed", "quarantined", "purged"}:
+                    history_retention_missing += 1
+                else:
+                    history_missing += 1
+                    if len(issues) < 100:
+                        issues.append(f"Duel {index + 1:,} image {side.upper()} is missing without a retention marker: `{raw}`")
+
+        favorites = json_documents.get("favorites_file", {})
+        favorite_references: set[str] = set()
+        favorite_missing = 0
+        if isinstance(favorites, dict):
+            favorite_images = favorites.get("image", {})
+            favorite_duels = favorites.get("duel", {})
+            if not isinstance(favorite_images, dict):
+                favorite_images = {}
+                issues.append("favorites_file: image favorites must be an object")
+            if not isinstance(favorite_duels, dict):
+                favorite_duels = {}
+                issues.append("favorites_file: duel favorites must be an object")
+            for entry in favorite_images.values():
+                if not isinstance(entry, dict):
+                    continue
+                metadata = entry.get("metadata", {}) if isinstance(entry.get("metadata", {}), dict) else {}
+                raw = str(metadata.get("path", "") or entry.get("key", "") or "").strip()
+                if raw:
+                    path = Path(raw)
+                    favorite_references.add(_path_identity(path))
+                    if not path.is_file():
+                        favorite_missing += 1
+            for entry in favorite_duels.values():
+                if not isinstance(entry, dict):
+                    continue
+                metadata = entry.get("metadata", {}) if isinstance(entry.get("metadata", {}), dict) else {}
+                for field in ("image_a_path", "image_b_path"):
+                    raw = str(metadata.get(field, "") or "").strip()
+                    if raw:
+                        path = Path(raw)
+                        favorite_references.add(_path_identity(path))
+                        if not path.is_file():
+                            favorite_missing += 1
+        if favorite_missing:
+            issues.append(f"{favorite_missing:,} favorite image reference(s) point to missing files.")
+
+        comparison_orphans = 0
+        try:
+            comparison_root = self._path_for_key("comparison_images_dir")
+            protected = history_references | favorite_references
+            for child in _iter_files(comparison_root):
+                if _path_identity(child) not in protected:
+                    comparison_orphans += 1
+        except Exception:
+            pass
+        if history_retention_missing:
+            warnings.append(
+                f"{history_retention_missing:,} historical comparison image(s) are absent with valid retention markers."
+            )
+        if comparison_orphans:
+            warnings.append(f"{comparison_orphans:,} unreferenced comparison-media file(s) were found.")
+
+        archive_checked = 0
+        archive_bad = 0
+        if deep:
+            candidates = sorted(
+                list(self.exports_dir.glob("*.zip")) + list(self.restore_points_dir.glob("*.zip")),
+                key=lambda value: value.stat().st_mtime,
+                reverse=True,
+            )[:10]
+            for archive_path in candidates:
+                archive_checked += 1
+                try:
+                    with zipfile.ZipFile(archive_path, "r", allowZip64=True) as archive:
+                        failed = archive.testzip()
+                        names = set(archive.namelist())
+                        manifest_name = next(
+                            (
+                                name for name in (
+                                    "artist_ranker_transfer_manifest.json",
+                                    "artist_ranker_restore_manifest.json",
+                                )
+                                if name in names
+                            ),
+                            "",
+                        )
+                        if manifest_name:
+                            manifest = json.loads(archive.read(manifest_name).decode("utf-8"))
+                            for row in manifest.get("entries", []):
+                                member = str(row.get("archive_path", "") or "")
+                                if member not in names:
+                                    raise ValueError(f"manifest member is missing: {member}")
+                                info = archive.getinfo(member)
+                                if int(info.file_size) != int(row.get("size", -1)):
+                                    raise ValueError(f"manifest size mismatch: {member}")
+                    if failed:
+                        archive_bad += 1
+                        issues.append(f"Backup `{archive_path.name}` failed its ZIP CRC check at `{failed}`.")
+                except Exception as exc:
+                    archive_bad += 1
+                    issues.append(f"Backup `{archive_path.name}` could not be read — {exc}")
+
         pending = self.journal_file.exists()
         if pending:
             issues.append("An incomplete operation journal is present.")
-        report = {"ok":not issues,"checked":checked,"issues":issues,"journal_present":pending,"time":time.time()}
+        report = {
+            "ok": not issues, "checked": checked, "issues": issues, "warnings": warnings,
+            "journal_present": pending, "time": time.time(), "deep": bool(deep),
+            "media_counts": media_counts, "portraits": len(portraits) if isinstance(portraits, dict) else 0,
+            "portrait_images_missing": portrait_missing, "portrait_sources_removed_by_retention": source_missing,
+            "portrait_orphans": portrait_orphans, "archives_checked": archive_checked,
+            "archives_failed": archive_bad,
+            "history_records": len(history_records), "history_images_missing": history_missing,
+            "history_images_removed_by_retention": history_retention_missing,
+            "favorite_images_missing": favorite_missing, "comparison_orphans": comparison_orphans,
+        }
         if issues:
-            text = "### Integrity check found problems\n" + "\n".join(f"- {issue}" for issue in issues)
+            text = "### Integrity check found problems\n" + "\n".join(f"- ❌ {issue}" for issue in issues)
         else:
-            text = f"✅ Integrity check passed for **{checked:,} metadata files**. No incomplete operation journal was found."
+            text = (
+                f"### ✅ Integrity check passed\nChecked **{checked:,} metadata files**, "
+                f"**{sum(media_counts.values()):,} managed media files**, and "
+                f"**{len(portraits) if isinstance(portraits, dict) else 0:,} portrait records** across "
+                f"**{len(history_records):,} duel records**. "
+                "No incomplete operation journal was found."
+            )
+        if warnings:
+            text += "\n\n#### Informational findings\n" + "\n".join(f"- ℹ️ {item}" for item in warnings)
+        if deep:
+            text += f"\n\nDeep audit verified **{archive_checked:,} recent backup archive(s)** and hashed managed media files."
         return text, report
 
     def _allowed_data_destination(self, destination: Path) -> bool:
@@ -961,6 +1281,153 @@ class TransferRecoveryManager:
             return "\n".join(lines)
         except Exception as exc:
             return f"❌ Release-feed check failed: {type(exc).__name__}: {exc}"
+
+    def _github_request(self, url: str, *, limit: int = 8 * 1024 * 1024) -> bytes:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": f"NovelAI-Artist-Ranker/{self.app_version}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = response.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("The GitHub response was unexpectedly large.")
+        return data
+
+    def github_release(self, channel: str = "stable") -> dict:
+        repository = self.github_repository
+        if not repository or "/" not in repository:
+            raise ValueError("The GitHub repository is not configured correctly.")
+        if str(channel).casefold() == "beta":
+            raw = json.loads(
+                self._github_request(f"{GITHUB_API_ROOT}/repos/{repository}/releases?per_page=20").decode("utf-8")
+            )
+            release = next((row for row in raw if isinstance(row, dict) and not row.get("draft")), None)
+        else:
+            release = json.loads(
+                self._github_request(f"{GITHUB_API_ROOT}/repos/{repository}/releases/latest").decode("utf-8")
+            )
+        if not isinstance(release, dict) or not release.get("tag_name"):
+            raise ValueError("GitHub did not return a usable release.")
+        release["_channel"] = "beta" if str(channel).casefold() == "beta" else "stable"
+        return release
+
+    def github_release_status(self, channel: str = "stable") -> Tuple[str, str]:
+        try:
+            release = self.github_release(channel)
+            latest = str(release.get("tag_name", "")).lstrip("vV")
+            relation = "up to date" if _version_tuple(latest) <= _version_tuple(self.app_version) else "update available"
+            assets = {
+                str(row.get("name", "")): row
+                for row in release.get("assets", [])
+                if isinstance(row, dict)
+            }
+            update_name = next(
+                (name for name in assets if "-Update-v" in name and name.lower().endswith(".zip")), ""
+            )
+            apk_name = "artist-ranker.apk" if "artist-ranker.apk" in assets else ""
+            text = (
+                f"### GitHub update status\n**Installed Windows version:** `{self.app_version}`  \n"
+                f"**Latest {release['_channel']} version:** `{latest}` — **{relation}**  \n"
+                f"**Repository:** [{self.github_repository}](https://github.com/{self.github_repository})  \n"
+                f"**Windows update package:** {'Ready' if update_name else 'Not published for this release'}  \n"
+                f"**Android APK:** {'Ready' if apk_name else 'Not published for this release'}\n\n"
+                f"{str(release.get('body', '') or 'No release notes were supplied.')[:4000]}"
+            )
+            return text, json.dumps({
+                "tag": latest,
+                "channel": release["_channel"],
+                "html_url": release.get("html_url", ""),
+                "assets": {
+                    name: {
+                        "url": row.get("browser_download_url", ""),
+                        "size": row.get("size", 0),
+                        "digest": row.get("digest", ""),
+                    }
+                    for name, row in assets.items()
+                },
+                "notes": str(release.get("body", "") or ""),
+            }, ensure_ascii=False)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return "❌ No published GitHub release was found.", ""
+            return f"❌ GitHub update check failed: HTTP {exc.code}.", ""
+        except Exception as exc:
+            return f"❌ GitHub update check failed: {type(exc).__name__}: {exc}", ""
+
+    def _download_url(self, url: str, destination: Path, expected_size: int = 0) -> Path:
+        if not str(url).lower().startswith("https://github.com/"):
+            raise ValueError("Only release assets hosted on github.com are accepted.")
+        destination = Path(destination).resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temp = destination.with_suffix(destination.suffix + ".download")
+        request = urllib.request.Request(
+            url, headers={"User-Agent": f"NovelAI-Artist-Ranker/{self.app_version}"}
+        )
+        written = 0
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response, temp.open("wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > 2 * 1024 * 1024 * 1024:
+                        raise ValueError("The downloaded release asset is unreasonably large.")
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if expected_size and written != int(expected_size):
+                raise ValueError(f"Download size mismatch: expected {expected_size}, received {written}.")
+            os.replace(temp, destination)
+            return destination
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def download_github_asset(self, release_text: str, kind: str) -> Tuple[str, Optional[Path]]:
+        try:
+            release = json.loads(str(release_text or ""))
+            assets = release.get("assets", {}) if isinstance(release, dict) else {}
+            if str(kind) == "apk":
+                name = "artist-ranker.apk"
+            else:
+                name = next(
+                    (value for value in assets if "-Update-v" in value and value.lower().endswith(".zip")), ""
+                )
+            row = assets.get(name, {}) if name else {}
+            if not row or not row.get("url"):
+                raise FileNotFoundError("The selected GitHub release does not contain that asset.")
+            destination = self.update_staging_dir / f"github_{release.get('tag','release')}_{name}"
+            path = self._download_url(str(row["url"]), destination, int(row.get("size", 0) or 0))
+            digest = _sha256_path(path)
+            published_digest = str(row.get("digest", "") or "")
+            if published_digest.lower().startswith("sha256:"):
+                expected = published_digest.split(":", 1)[1].strip().lower()
+                if digest.lower() != expected:
+                    path.unlink(missing_ok=True)
+                    raise ValueError("The downloaded asset failed its published SHA-256 digest check.")
+            else:
+                sums = assets.get("SHA256SUMS.txt", {})
+                sums_url = str(sums.get("url", "") or "") if isinstance(sums, dict) else ""
+                if not sums_url:
+                    path.unlink(missing_ok=True)
+                    raise ValueError("The release has no published SHA-256 digest for this asset.")
+                checksum_text = self._github_request(sums_url, limit=1024 * 1024).decode("utf-8", errors="replace")
+                expected = ""
+                for line in checksum_text.splitlines():
+                    fields = line.strip().split()
+                    if len(fields) >= 2 and fields[-1].lstrip("*") == name:
+                        expected = fields[0].lower()
+                        break
+                if not expected or digest.lower() != expected:
+                    path.unlink(missing_ok=True)
+                    raise ValueError("The downloaded asset failed its SHA256SUMS.txt check.")
+            return f"✅ Downloaded and verified `{name}`.  \nSHA-256: `{digest}`", path
+        except Exception as exc:
+            return f"❌ Could not download the GitHub asset: {type(exc).__name__}: {exc}", None
 
 
 def process_pending_update_bootstrap(program_dir: Path) -> str:

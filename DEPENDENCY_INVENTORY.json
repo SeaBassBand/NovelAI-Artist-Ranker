@@ -1,0 +1,454 @@
+{
+  "schema": 1,
+  "application": "NovelAI Artist Ranker",
+  "version": "2.6.0",
+  "python": [
+    {
+      "name": "annotated-doc",
+      "version": "0.0.4",
+      "license": "MIT"
+    },
+    {
+      "name": "annotated-types",
+      "version": "0.7.0",
+      "license": "unknown"
+    },
+    {
+      "name": "anyio",
+      "version": "4.14.2",
+      "license": "MIT"
+    },
+    {
+      "name": "argon2-cffi",
+      "version": "25.1.0",
+      "license": "MIT"
+    },
+    {
+      "name": "argon2-cffi-bindings",
+      "version": "25.1.0",
+      "license": "MIT"
+    },
+    {
+      "name": "arrow",
+      "version": "1.4.0",
+      "license": "unknown"
+    },
+    {
+      "name": "bchlib",
+      "version": "2.1.3",
+      "license": "unknown"
+    },
+    {
+      "name": "brotli",
+      "version": "1.2.0",
+      "license": "MIT"
+    },
+    {
+      "name": "certifi",
+      "version": "2026.6.17",
+      "license": "MPL-2.0"
+    },
+    {
+      "name": "cffi",
+      "version": "2.1.0",
+      "license": "MIT-0"
+    },
+    {
+      "name": "charset-normalizer",
+      "version": "3.4.9",
+      "license": "MIT"
+    },
+    {
+      "name": "click",
+      "version": "8.4.2",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "colorama",
+      "version": "0.4.6",
+      "license": "unknown"
+    },
+    {
+      "name": "colorlog",
+      "version": "6.10.1",
+      "license": "MIT License"
+    },
+    {
+      "name": "cryptography",
+      "version": "50.0.0",
+      "license": "Apache-2.0 OR BSD-3-Clause"
+    },
+    {
+      "name": "curl_cffi",
+      "version": "0.15.0",
+      "license": "MIT"
+    },
+    {
+      "name": "elara",
+      "version": "0.5.5",
+      "license": "three-clause BSD"
+    },
+    {
+      "name": "fake-useragent",
+      "version": "2.2.0",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "fastapi",
+      "version": "0.139.0",
+      "license": "MIT"
+    },
+    {
+      "name": "filelock",
+      "version": "3.29.7",
+      "license": "MIT"
+    },
+    {
+      "name": "fsspec",
+      "version": "2026.6.0",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "ftfy",
+      "version": "6.3.1",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "gradio",
+      "version": "6.20.0",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "gradio_client",
+      "version": "2.5.0",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "groovy",
+      "version": "0.1.2",
+      "license": "unknown"
+    },
+    {
+      "name": "h11",
+      "version": "0.16.0",
+      "license": "MIT"
+    },
+    {
+      "name": "hf-gradio",
+      "version": "0.4.1",
+      "license": "MIT"
+    },
+    {
+      "name": "hf-xet",
+      "version": "1.5.1",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "httpcore",
+      "version": "1.0.9",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "httptools",
+      "version": "0.8.0",
+      "license": "MIT"
+    },
+    {
+      "name": "httpx",
+      "version": "0.28.1",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "huggingface_hub",
+      "version": "1.23.0",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "idna",
+      "version": "3.18",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "Jinja2",
+      "version": "3.1.6",
+      "license": "unknown"
+    },
+    {
+      "name": "json_repair",
+      "version": "0.61.4",
+      "license": "MIT"
+    },
+    {
+      "name": "loguru",
+      "version": "0.7.3",
+      "license": "unknown"
+    },
+    {
+      "name": "markdown-it-py",
+      "version": "4.2.0",
+      "license": "unknown"
+    },
+    {
+      "name": "MarkupSafe",
+      "version": "3.0.3",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "mdurl",
+      "version": "0.1.2",
+      "license": "unknown"
+    },
+    {
+      "name": "msgpack",
+      "version": "1.2.1",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "novelai-python",
+      "version": "0.7.12",
+      "license": "Apache License 2.0"
+    },
+    {
+      "name": "numpy",
+      "version": "2.4.6",
+      "license": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0"
+    },
+    {
+      "name": "opencv-python",
+      "version": "5.0.0.93",
+      "license": "Apache 2.0"
+    },
+    {
+      "name": "orjson",
+      "version": "3.11.9",
+      "license": "MPL-2.0 AND (Apache-2.0 OR MIT)"
+    },
+    {
+      "name": "packaging",
+      "version": "26.2",
+      "license": "Apache-2.0 OR BSD-2-Clause"
+    },
+    {
+      "name": "pandas",
+      "version": "3.0.3",
+      "license": "BSD 3-Clause License\n\n Copyright (c) 2008-2011, AQR Capital Management, LLC, Lambda Foundry, Inc. and PyData Development Team\n All rights reserved.\n\n Copyright (c) 2011-2026, Open source contributors.\n\n Redistribution and use in source and binary forms, with or without\n modification, are permitted provided that the following conditions are met:\n\n * Redistributions of source code must retain the above copyright notice, this\n   list of conditions and the following disclaimer.\n\n * Redistributions in binary form must reproduce the above copyright notice,\n   this list of conditions and the following disclaimer in the documentation\n   and/or other materials provided with the distribution.\n\n * Neither the name of the copyright holder nor the names of its\n   contributors may be used to endorse or promote products derived from\n   this software without specific prior written permission.\n\n THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\"\n AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE\n IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE\n DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE\n FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL\n DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR\n SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER\n CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,\n OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE\n OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.\n"
+    },
+    {
+      "name": "pillow",
+      "version": "12.3.0",
+      "license": "MIT-CMU"
+    },
+    {
+      "name": "pycparser",
+      "version": "3.0",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "pydantic",
+      "version": "2.13.4",
+      "license": "MIT"
+    },
+    {
+      "name": "pydantic-settings",
+      "version": "2.14.2",
+      "license": "MIT"
+    },
+    {
+      "name": "pydantic_core",
+      "version": "2.46.4",
+      "license": "MIT"
+    },
+    {
+      "name": "pydub",
+      "version": "0.25.1",
+      "license": "MIT"
+    },
+    {
+      "name": "Pygments",
+      "version": "2.20.0",
+      "license": "BSD-2-Clause"
+    },
+    {
+      "name": "PyNaCl",
+      "version": "1.6.2",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "python-dateutil",
+      "version": "2.9.0.post0",
+      "license": "Dual License"
+    },
+    {
+      "name": "python-dotenv",
+      "version": "1.2.2",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "python-multipart",
+      "version": "0.0.32",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "pytz",
+      "version": "2026.2",
+      "license": "MIT"
+    },
+    {
+      "name": "PyYAML",
+      "version": "6.0.3",
+      "license": "MIT"
+    },
+    {
+      "name": "regex",
+      "version": "2026.7.10",
+      "license": "Apache-2.0 AND CNRI-Python"
+    },
+    {
+      "name": "requests",
+      "version": "2.34.2",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "rich",
+      "version": "15.0.0",
+      "license": "MIT"
+    },
+    {
+      "name": "robust-downloader",
+      "version": "0.0.2",
+      "license": "unknown"
+    },
+    {
+      "name": "safehttpx",
+      "version": "0.1.7",
+      "license": "unknown"
+    },
+    {
+      "name": "safer",
+      "version": "5.4.0",
+      "license": "MIT"
+    },
+    {
+      "name": "semantic-version",
+      "version": "2.10.0",
+      "license": "BSD"
+    },
+    {
+      "name": "sentencepiece",
+      "version": "0.2.2",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "setuptools",
+      "version": "83.0.0",
+      "license": "MIT"
+    },
+    {
+      "name": "shellingham",
+      "version": "1.5.4",
+      "license": "ISC License"
+    },
+    {
+      "name": "shortuuid",
+      "version": "1.0.13",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "six",
+      "version": "1.17.0",
+      "license": "MIT"
+    },
+    {
+      "name": "starlette",
+      "version": "1.3.1",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "tenacity",
+      "version": "9.1.4",
+      "license": "Apache 2.0"
+    },
+    {
+      "name": "tokenizers",
+      "version": "0.23.1",
+      "license": "unknown"
+    },
+    {
+      "name": "tomlkit",
+      "version": "0.14.0",
+      "license": "MIT"
+    },
+    {
+      "name": "tqdm",
+      "version": "4.68.4",
+      "license": "MPL-2.0 AND MIT"
+    },
+    {
+      "name": "typer",
+      "version": "0.26.8",
+      "license": "MIT"
+    },
+    {
+      "name": "typing-inspection",
+      "version": "0.4.2",
+      "license": "MIT"
+    },
+    {
+      "name": "typing_extensions",
+      "version": "4.16.0",
+      "license": "PSF-2.0"
+    },
+    {
+      "name": "tzdata",
+      "version": "2026.3",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "urllib3",
+      "version": "2.7.0",
+      "license": "MIT"
+    },
+    {
+      "name": "uvicorn",
+      "version": "0.51.0",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "watchfiles",
+      "version": "1.2.0",
+      "license": "MIT"
+    },
+    {
+      "name": "wcwidth",
+      "version": "0.8.2",
+      "license": "MIT"
+    },
+    {
+      "name": "websockets",
+      "version": "16.1",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "win32_setctime",
+      "version": "1.2.0",
+      "license": "MIT license"
+    }
+  ],
+  "android_gradle": [
+    {
+      "configuration": "plugin",
+      "coordinate": "com.android.application:9.3.0"
+    }
+  ],
+  "android_toolchain": {
+    "compile_sdk": 36,
+    "minimum_sdk": 26,
+    "target_sdk": 36,
+    "java": 17,
+    "gradle": "9.5.0",
+    "build_tools": "36.0.0",
+    "jdk": "17.0.20"
+  },
+  "javascript": [],
+  "notes": "Python versions are frozen from the embedded runtime. Android plugins, coordinates, and toolchain versions are parsed from the private build source; JavaScript is bundled source with no package manager dependencies."
+}

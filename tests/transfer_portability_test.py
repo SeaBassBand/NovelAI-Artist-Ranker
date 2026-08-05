@@ -13,8 +13,8 @@ if not (SOURCE_ROOT / "backup_transfer_recovery.py").is_file():
     SOURCE_ROOT = REPOSITORY_ROOT.parent
 sys.path.insert(0, str(SOURCE_ROOT))
 
+import backup_transfer_recovery as recovery_module  # noqa: E402
 from backup_transfer_recovery import (  # noqa: E402
-    MEDIA_KEYS,
     METADATA_KEYS,
     TransferRecoveryManager,
     _rewrite_portrait_metadata_paths,
@@ -64,10 +64,14 @@ with tempfile.TemporaryDirectory(prefix="artist-ranker-portability-") as temp_na
     root = Path(temp_name)
     source_layout = TestLayout(root / "old-data-location")
     old_portrait, old_comparison = write_fixture(source_layout)
+    preview_cache = source_layout.path("comparison_images_dir") / ".duel_previews" / "rebuildable.jpg"
+    preview_cache.parent.mkdir(parents=True, exist_ok=True)
+    preview_cache.write_bytes(b"rebuildable-cache")
     source_manager = TransferRecoveryManager(root / "program", source_layout, "2.5.3")
 
     _report, export_path = source_manager.create_export("complete", "portability-test")
     with zipfile.ZipFile(export_path) as archive:
+        assert not any(".duel_previews" in name for name in archive.namelist())
         manifest = json.loads(archive.read("artist_ranker_transfer_manifest.json"))
         portrait_metadata = json.loads(
             archive.read("data/artist_portraits_file/artist_portraits.json")
@@ -94,6 +98,20 @@ with tempfile.TemporaryDirectory(prefix="artist-ranker-portability-") as temp_na
     assert restored_metadata["source_path"] == str(expected_comparison.resolve())
     assert expected_portrait.read_bytes() == b"portrait"
     assert expected_comparison.read_bytes() == b"comparison"
+
+    # A failed export must not leave a corrupt destination or hidden partial ZIP.
+    original_writer = recovery_module._write_file_with_hash
+    try:
+        recovery_module._write_file_with_hash = lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("fixture failure"))
+        try:
+            source_manager.create_export("complete", "forced-failure")
+            raise AssertionError("The forced export failure unexpectedly succeeded")
+        except OSError as error:
+            assert "fixture failure" in str(error)
+    finally:
+        recovery_module._write_file_with_hash = original_writer
+    assert not list(source_manager.exports_dir.glob("*forced-failure*.zip"))
+    assert not list(source_manager.exports_dir.glob(".*.partial"))
 
     # A 2.5.2-style absolute-path payload is also relocated safely.
     legacy_payload = {

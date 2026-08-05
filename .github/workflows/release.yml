@@ -13,6 +13,7 @@ jobs:
           python-version: '3.11'
       - run: python tests/smoke_test.py
       - run: python tests/transfer_portability_test.py
+      - run: python tests/phase9_maintenance_test.py
       - name: Verify locked dependencies file
         run: |
           if (!(Test-Path requirements.lock.txt)) { throw "requirements.lock.txt missing" }
@@ -24,4 +25,5 @@ jobs:
             src
             packaging
             requirements.lock.txt
+            DEPENDENCY_INVENTORY.json
             RELEASE_NOTES.md

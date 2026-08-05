@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- The ranker is a private LAN service currently served over HTTP. Host restrictions
+         are enforced in MainActivity before any URL is allowed to remain in the WebView. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

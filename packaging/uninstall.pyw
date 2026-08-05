@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import json, os, shutil, subprocess, sys, time, urllib.request
+import os, subprocess, time, urllib.request
 from pathlib import Path
 import winreg
 import tkinter as tk

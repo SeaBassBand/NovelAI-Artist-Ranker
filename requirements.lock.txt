@@ -12,7 +12,7 @@ charset-normalizer==3.4.9
 click==8.4.2
 colorama==0.4.6
 colorlog==6.10.1
-cryptography==49.0.0
+cryptography==50.0.0
 curl_cffi==0.15.0
 elara==0.5.5
 fake-useragent==2.2.0
@@ -31,7 +31,6 @@ httptools==0.8.0
 httpx==0.28.1
 huggingface_hub==1.23.0
 idna==3.18
-ifaddr==0.2.0
 Jinja2==3.1.6
 json_repair==0.61.4
 loguru==0.7.3
@@ -46,7 +45,6 @@ orjson==3.11.9
 packaging==26.2
 pandas==3.0.3
 pillow==12.3.0
-pip==24.0
 pycparser==3.0
 pydantic==2.13.4
 pydantic_core==2.46.4
@@ -67,7 +65,7 @@ safehttpx==0.1.7
 safer==5.4.0
 semantic-version==2.10.0
 sentencepiece==0.2.2
-setuptools==65.5.0
+setuptools==83.0.0
 shellingham==1.5.4
 shortuuid==1.0.13
 six==1.17.0
@@ -86,4 +84,3 @@ watchfiles==1.2.0
 wcwidth==0.8.2
 websockets==16.1
 win32_setctime==1.2.0
-zeroconf==0.150.0

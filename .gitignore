@@ -13,8 +13,14 @@ public-release/
 android-builder/toolchain/
 android-builder/gradle-cache/
 android-builder/.gradle/
+android-builder/project/.gradle/
+android-builder/project/**/build/
+android-builder/output/
+android-builder/logs/
 android-builder/signing/
 android-builder/project/keystore.properties
 android-builder/project/local.properties
 *.jks
 *.keystore
+.shipping-audit-*
+.shipping-source-*

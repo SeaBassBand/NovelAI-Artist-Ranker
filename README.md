@@ -7,7 +7,8 @@ A local blind-comparison ranker for NovelAI artist tags, with desktop and paired
 Download the current release assets:
 
 - `NovelAI-Artist-Ranker-Setup.exe`
-- `NovelAI-Artist-Ranker-Portable-v2.5.3.zip`
+- `NovelAI-Artist-Ranker-Portable-v2.6.0.zip`
+- `NovelAI-Artist-Ranker-Update-v2.6.0.zip`
 - `artist-ranker.apk`
 - `SHA256SUMS.txt`
 - `RELEASE_NOTES.md`
