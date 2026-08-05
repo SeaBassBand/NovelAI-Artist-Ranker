@@ -1,0 +1,9 @@
+[project]
+name = "novelai-artist-ranker"
+version = "2.5.3"
+requires-python = "==3.11.*"
+description = "Local blind-comparison ranker for NovelAI artist tags"
+license = {text = "MIT"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

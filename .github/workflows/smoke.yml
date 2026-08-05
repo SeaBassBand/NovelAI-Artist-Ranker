@@ -1,0 +1,14 @@
+name: Smoke tests
+on:
+  push:
+  pull_request:
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python tests/smoke_test.py
+      - run: python tests/transfer_portability_test.py

@@ -1,0 +1,27 @@
+name: Release validation
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python tests/smoke_test.py
+      - run: python tests/transfer_portability_test.py
+      - name: Verify locked dependencies file
+        run: |
+          if (!(Test-Path requirements.lock.txt)) { throw "requirements.lock.txt missing" }
+      - name: Archive sanitized source
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitized-source
+          path: |
+            src
+            packaging
+            requirements.lock.txt
+            RELEASE_NOTES.md
