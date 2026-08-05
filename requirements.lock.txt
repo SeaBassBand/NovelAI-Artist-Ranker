@@ -18,7 +18,7 @@ elara==0.5.5
 fake-useragent==2.2.0
 fastapi==0.139.0
 filelock==3.29.7
-fsspec==2026.6.0
+fsspec==2026.7.0
 ftfy==6.3.1
 gradio==6.20.0
 gradio_client==2.5.0
