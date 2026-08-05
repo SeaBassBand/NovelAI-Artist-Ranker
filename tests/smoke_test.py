@@ -20,6 +20,7 @@ required_source = [
     "artist_elo_ranker_buffered.py", "ranker_data_layout.py", "novelai_credential_store.py",
     "generation_profiles.py", "storage_retention.py", "phone_pairing.py",
     "onboarding_guidance.py", "backup_transfer_recovery.py", "lan_hostname.py",
+    "historical_media.py",
 ]
 for name in required_source:
     path = SRC / name

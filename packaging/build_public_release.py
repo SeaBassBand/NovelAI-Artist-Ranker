@@ -32,7 +32,8 @@ PRIVATE_NAMES = {
 PROGRAM_ALLOWLIST = (
     "artist_elo_ranker_buffered.py", "ranker_data_layout.py", "novelai_credential_store.py",
     "generation_profiles.py", "storage_retention.py", "phone_pairing.py",
-    "onboarding_guidance.py", "backup_transfer_recovery.py", "lan_hostname.py", "qrcode",
+    "onboarding_guidance.py", "backup_transfer_recovery.py", "historical_media.py",
+    "lan_hostname.py", "qrcode",
 )
 RUNTIME_FILES = (
     "public_launcher.pyw", "uninstall.pyw", "launcher_guard.ps1", "run_visible.ps1",

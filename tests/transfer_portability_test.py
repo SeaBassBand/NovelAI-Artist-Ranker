@@ -39,7 +39,7 @@ class TestLayout:
         return self.paths[key]
 
 
-def write_fixture(layout: TestLayout) -> tuple[Path, Path]:
+def write_fixture(layout: TestLayout) -> tuple[Path, Path, Path]:
     portrait = layout.path("artist_portraits_dir") / "artist_test.jpg"
     comparison = layout.path("comparison_images_dir") / "compare_test.png"
     portrait.parent.mkdir(parents=True, exist_ok=True)
@@ -57,13 +57,38 @@ def write_fixture(layout: TestLayout) -> tuple[Path, Path]:
     metadata_path = layout.path("artist_portraits_file")
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    return portrait, comparison
+    history_path = layout.path("comparison_history_file")
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(json.dumps([{
+        "duel_id": "portable-duel",
+        "image_a_path": rf"D:\old\Data\media\comparison_images\{comparison.name}",
+        "image_b_path": str(comparison),
+    }], indent=2), encoding="utf-8")
+    favorite_archive = layout.path("favorite_duel_archive_dir") / "fixture" / "images" / "favorite.png"
+    favorite_archive.parent.mkdir(parents=True, exist_ok=True)
+    favorite_archive.write_bytes(b"favorite")
+    favorite_key = rf"D:\old\Data\media\comparison_images\{comparison.name}"
+    favorites_path = layout.path("favorites_file")
+    favorites_path.parent.mkdir(parents=True, exist_ok=True)
+    favorites_path.write_text(json.dumps({
+        "artist": {}, "combination": {}, "duel": {},
+        "image": {
+            favorite_key: {
+                "key": favorite_key,
+                "metadata": {
+                    "path": rf"D:\old\Data\media\favorite_duels\fixture\images\{favorite_archive.name}",
+                    "image_a_path": favorite_key,
+                },
+            }
+        },
+    }, indent=2), encoding="utf-8")
+    return portrait, comparison, favorite_archive
 
 
 with tempfile.TemporaryDirectory(prefix="artist-ranker-portability-") as temp_name:
     root = Path(temp_name)
     source_layout = TestLayout(root / "old-data-location")
-    old_portrait, old_comparison = write_fixture(source_layout)
+    old_portrait, old_comparison, old_favorite = write_fixture(source_layout)
     preview_cache = source_layout.path("comparison_images_dir") / ".duel_previews" / "rebuildable.jpg"
     preview_cache.parent.mkdir(parents=True, exist_ok=True)
     preview_cache.write_bytes(b"rebuildable-cache")
@@ -76,12 +101,25 @@ with tempfile.TemporaryDirectory(prefix="artist-ranker-portability-") as temp_na
         portrait_metadata = json.loads(
             archive.read("data/artist_portraits_file/artist_portraits.json")
         )
+        history_metadata = json.loads(
+            archive.read("data/comparison_history_file/comparison_history_file.json")
+        )
+        favorite_metadata = json.loads(
+            archive.read("data/favorites_file/favorites_file.json")
+        )
     exported = portrait_metadata["test artist"]
     assert manifest["portable_media_references"] is True
-    assert manifest["portable_media_reference_version"] == 1
+    assert manifest["portable_media_reference_version"] == 2
     assert exported["portrait_path"] == "artist_portraits/artist_test.jpg"
     assert exported["source_path"] == "comparison_images/compare_test.png"
     assert str(source_layout.active_layout.root) not in json.dumps(portrait_metadata)
+    assert history_metadata[0]["image_a_path"] == "comparison_images/compare_test.png"
+    assert history_metadata[0]["image_b_path"] == "comparison_images/compare_test.png"
+    exported_image_key = next(iter(favorite_metadata["image"]))
+    assert exported_image_key == "comparison_images/compare_test.png"
+    assert favorite_metadata["image"][exported_image_key]["metadata"]["path"] == (
+        "favorite_duels/fixture/images/favorite.png"
+    )
 
     destination_layout = TestLayout(root / "new-data-location")
     destination_manager = TransferRecoveryManager(root / "program", destination_layout, "2.5.3")
@@ -98,6 +136,21 @@ with tempfile.TemporaryDirectory(prefix="artist-ranker-portability-") as temp_na
     assert restored_metadata["source_path"] == str(expected_comparison.resolve())
     assert expected_portrait.read_bytes() == b"portrait"
     assert expected_comparison.read_bytes() == b"comparison"
+    restored_history = json.loads(
+        destination_layout.path("comparison_history_file").read_text(encoding="utf-8")
+    )
+    assert restored_history[0]["image_a_path"] == str(expected_comparison.resolve())
+    assert restored_history[0]["image_b_path"] == str(expected_comparison.resolve())
+    restored_favorites = json.loads(
+        destination_layout.path("favorites_file").read_text(encoding="utf-8")
+    )
+    restored_image_key = next(iter(restored_favorites["image"]))
+    assert restored_image_key == str(expected_comparison.resolve())
+    expected_favorite = (
+        destination_layout.path("favorite_duel_archive_dir") / "fixture" / "images" / old_favorite.name
+    ).resolve()
+    assert restored_favorites["image"][restored_image_key]["metadata"]["path"] == str(expected_favorite)
+    assert expected_favorite.read_bytes() == b"favorite"
 
     # A failed export must not leave a corrupt destination or hidden partial ZIP.
     original_writer = recovery_module._write_file_with_hash

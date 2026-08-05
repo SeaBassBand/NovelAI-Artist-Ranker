@@ -27,8 +27,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from historical_media import (
+    COMPARISON_KIND,
+    HistoricalMediaResolver,
+    rewrite_favorite_media_paths,
+    rewrite_history_media_paths,
+)
+
 TRANSFER_SCHEMA_VERSION = 1
-PORTABLE_MEDIA_REFERENCE_VERSION = 1
+PORTABLE_MEDIA_REFERENCE_VERSION = 2
 UPDATE_SCHEMA_VERSION = 1
 DEFAULT_GITHUB_REPOSITORY = "SeaBassBand/NovelAI-Artist-Ranker"
 GITHUB_API_ROOT = "https://api.github.com"
@@ -75,7 +82,7 @@ EXPORT_MODES = {
 PROGRAM_BACKUP_NAMES = (
     "artist_elo_ranker_buffered.py", "ranker_data_layout.py", "generation_profiles.py",
     "storage_retention.py", "phone_pairing.py", "novelai_credential_store.py",
-    "onboarding_guidance.py", "backup_transfer_recovery.py", "config.py",
+    "onboarding_guidance.py", "backup_transfer_recovery.py", "historical_media.py", "config.py",
 )
 PROGRAM_BACKUP_DIRS = ("android-builder/project",)
 
@@ -351,6 +358,10 @@ class TransferRecoveryManager:
         self.data_layout = data_layout
         self.app_version = str(app_version)
         self.data_root = Path(data_layout.active_layout.root).resolve()
+        self.media_resolver = HistoricalMediaResolver(
+            self._path_for_key("comparison_images_dir"),
+            self._path_for_key("favorite_duel_archive_dir"),
+        )
         self.root = self.data_root / "recovery"
         self.github_repository = str(github_repository or DEFAULT_GITHUB_REPOSITORY).strip(" /")
         self.backup_root = Path(backup_root).expanduser().resolve() if backup_root else self.default_backup_root()
@@ -479,13 +490,22 @@ class TransferRecoveryManager:
                     if arc_text in seen:
                         continue
                     seen.add(arc_text)
-                    if key == "artist_portraits_file":
-                        portrait_data = json.loads(child.read_text(encoding="utf-8"))
-                        portrait_data, rewritten = _rewrite_portrait_metadata_paths(
-                            portrait_data,
-                            portable=True,
-                        )
-                        payload = json.dumps(portrait_data, ensure_ascii=False, indent=2).encode("utf-8")
+                    if key in {"artist_portraits_file", "comparison_history_file", "favorites_file"}:
+                        metadata = json.loads(child.read_text(encoding="utf-8"))
+                        if key == "artist_portraits_file":
+                            metadata, rewritten = _rewrite_portrait_metadata_paths(
+                                metadata,
+                                portable=True,
+                            )
+                        elif key == "comparison_history_file":
+                            metadata, rewritten = rewrite_history_media_paths(
+                                metadata, self.media_resolver, portable=True
+                            )
+                        else:
+                            metadata, rewritten = rewrite_favorite_media_paths(
+                                metadata, self.media_resolver, portable=True
+                            )
+                        payload = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
                         portable_references += rewritten
                         size = len(payload)
                         digest = _sha256_bytes(payload)
@@ -839,7 +859,7 @@ class TransferRecoveryManager:
                     "new_destinations": new_destinations,
                 },
             )
-            written = skipped = merged = portrait_paths_rewritten = 0
+            written = skipped = merged = portrait_paths_rewritten = media_paths_rewritten = 0
             with zipfile.ZipFile(archive_path, "r", allowZip64=True) as archive:
                 for row in entries:
                     destination = Path(row["destination"]).resolve()
@@ -857,15 +877,27 @@ class TransferRecoveryManager:
                         incoming = json.loads(data.decode("utf-8"))
                         data = json.dumps(_merge_json(existing, incoming), ensure_ascii=False, indent=2).encode("utf-8")
                         merged += 1
-                    if str(row.get("logical_key")) == "artist_portraits_file":
-                        portrait_data = json.loads(data.decode("utf-8"))
-                        portrait_data, rewritten = _rewrite_portrait_metadata_paths(
-                            portrait_data,
-                            portrait_root=self._path_for_key("artist_portraits_dir"),
-                            comparison_root=self._path_for_key("comparison_images_dir"),
-                        )
-                        portrait_paths_rewritten += rewritten
-                        data = json.dumps(portrait_data, ensure_ascii=False, indent=2).encode("utf-8")
+                    logical_key = str(row.get("logical_key"))
+                    if logical_key in {"artist_portraits_file", "comparison_history_file", "favorites_file"}:
+                        metadata = json.loads(data.decode("utf-8"))
+                        if logical_key == "artist_portraits_file":
+                            metadata, rewritten = _rewrite_portrait_metadata_paths(
+                                metadata,
+                                portrait_root=self._path_for_key("artist_portraits_dir"),
+                                comparison_root=self._path_for_key("comparison_images_dir"),
+                            )
+                            portrait_paths_rewritten += rewritten
+                        elif logical_key == "comparison_history_file":
+                            metadata, rewritten = rewrite_history_media_paths(
+                                metadata, self.media_resolver, portable=False
+                            )
+                            media_paths_rewritten += rewritten
+                        else:
+                            metadata, rewritten = rewrite_favorite_media_paths(
+                                metadata, self.media_resolver, portable=False
+                            )
+                            media_paths_rewritten += rewritten
+                        data = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     fd, temp_name = tempfile.mkstemp(prefix=destination.name+".", suffix=".import.tmp", dir=str(destination.parent))
                     temp = Path(temp_name)
@@ -880,16 +912,19 @@ class TransferRecoveryManager:
                     finally:
                         temp.unlink(missing_ok=True)
                     written += 1
+            self.media_resolver.invalidate()
             report = {
                 "ok": True, "operation": "import", "written": written, "merged": merged,
                 "skipped": skipped, "restore_point": str(restore_point),
                 "portrait_paths_rewritten": portrait_paths_rewritten,
+                "media_paths_rewritten": media_paths_rewritten,
                 "finished_at": time.time(), "restart_required": True,
             }
             self._complete_journal(report)
             return (
                 f"✅ Import applied: **{written:,} written**, **{merged:,} JSON files merged**, "
-                f"**{skipped:,} skipped**, **{portrait_paths_rewritten:,} portrait references relocated**. "
+                f"**{skipped:,} skipped**, **{portrait_paths_rewritten:,} portrait references relocated**, "
+                f"**{media_paths_rewritten:,} history/favorite media references relocated**. "
                 f"Restart the ranker. "
                 f"Pre-import restore point: `{restore_point.name}`."
             )
@@ -964,8 +999,12 @@ class TransferRecoveryManager:
                     portrait_missing += 1
                     issues.append(f"Portrait image is missing for {artist!r}: `{portrait_text or 'not recorded'}`")
                 source_text = str(entry.get("source_path", "") or "").strip()
-                if source_text and not Path(source_text).is_file():
-                    source_missing += 1
+                if source_text:
+                    source_resolution = self.media_resolver.resolve(
+                        source_text, default_kind=COMPARISON_KIND
+                    )
+                    if not source_resolution.available:
+                        source_missing += 1
         portrait_orphans = 0
         try:
             portrait_root = self._path_for_key("artist_portraits_dir")
@@ -990,6 +1029,7 @@ class TransferRecoveryManager:
         history_references: set[str] = set()
         history_missing = 0
         history_retention_missing = 0
+        self.media_resolver.prime_history(history_records)
         for index, record in enumerate(history_records):
             if not isinstance(record, dict):
                 if len(issues) < 100:
@@ -999,18 +1039,19 @@ class TransferRecoveryManager:
                 raw = str(record.get(f"image_{side}_path", "") or "").strip()
                 if not raw:
                     continue
-                path = Path(raw)
-                history_references.add(_path_identity(path))
-                if path.is_file():
+                resolution = self.media_resolver.resolve(
+                    raw, record=record, side=side, default_kind=COMPARISON_KIND
+                )
+                if resolution.available:
+                    history_references.add(_path_identity(Path(resolution.resolved_path)))
                     continue
-                retained = record.get(f"image_{side}_retained")
-                status = str(record.get(f"image_{side}_retention_status", "") or "").casefold()
-                if retained is False or status in {"removed", "quarantined", "purged"}:
+                if resolution.status == "retention_removed":
                     history_retention_missing += 1
                 else:
                     history_missing += 1
                     if len(issues) < 100:
-                        issues.append(f"Duel {index + 1:,} image {side.upper()} is missing without a retention marker: `{raw}`")
+                        detail = "ambiguous after relocation" if resolution.status == "ambiguous" else "missing without a retention marker"
+                        issues.append(f"Duel {index + 1:,} image {side.upper()} is {detail}: `{raw}`")
 
         favorites = json_documents.get("favorites_file", {})
         favorite_references: set[str] = set()
@@ -1030,9 +1071,10 @@ class TransferRecoveryManager:
                 metadata = entry.get("metadata", {}) if isinstance(entry.get("metadata", {}), dict) else {}
                 raw = str(metadata.get("path", "") or entry.get("key", "") or "").strip()
                 if raw:
-                    path = Path(raw)
-                    favorite_references.add(_path_identity(path))
-                    if not path.is_file():
+                    resolution = self.media_resolver.resolve(raw)
+                    if resolution.available:
+                        favorite_references.add(_path_identity(Path(resolution.resolved_path)))
+                    else:
                         favorite_missing += 1
             for entry in favorite_duels.values():
                 if not isinstance(entry, dict):
@@ -1041,9 +1083,10 @@ class TransferRecoveryManager:
                 for field in ("image_a_path", "image_b_path"):
                     raw = str(metadata.get(field, "") or "").strip()
                     if raw:
-                        path = Path(raw)
-                        favorite_references.add(_path_identity(path))
-                        if not path.is_file():
+                        resolution = self.media_resolver.resolve(raw)
+                        if resolution.available:
+                            favorite_references.add(_path_identity(Path(resolution.resolved_path)))
+                        else:
                             favorite_missing += 1
         if favorite_missing:
             issues.append(f"{favorite_missing:,} favorite image reference(s) point to missing files.")

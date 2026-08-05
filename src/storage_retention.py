@@ -18,6 +18,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from historical_media import COMPARISON_KIND, HistoricalMediaResolver
+
 RETENTION_SCHEMA_VERSION = 1
 DEFAULT_RETENTION_SETTINGS: Dict[str, Any] = {
     "image_retention_policy": "keep_all",
@@ -181,10 +183,20 @@ class RetentionResult:
 class RetentionManager:
     """Build and execute safe retention plans with optional recovery quarantine."""
 
-    def __init__(self, quarantine_dir: Path, state_file: Path):
+    def __init__(
+        self,
+        quarantine_dir: Path,
+        state_file: Path,
+        comparison_root: Optional[Path] = None,
+    ):
         self.quarantine_dir = Path(quarantine_dir)
         self.state_file = Path(state_file)
         self.lock = threading.RLock()
+        self.media_resolver = (
+            HistoricalMediaResolver(comparison_root)
+            if comparison_root is not None
+            else None
+        )
         self.quarantine_dir.mkdir(parents=True, exist_ok=True)
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state = self._load_state()
@@ -255,6 +267,8 @@ class RetentionManager:
         protected_bytes = 0
         protected_count = 0
 
+        if self.media_resolver is not None:
+            self.media_resolver.prime_history(history)
         for index, record in enumerate(history):
             history_number = index + 1
             duel_id = self._record_duel_id(record, history_number)
@@ -264,10 +278,24 @@ class RetentionManager:
             for side, field_name in (("A", "image_a_path"), ("B", "image_b_path")):
                 raw_path = str(record.get(field_name, "") or "").strip()
                 normalized = _normalized_path(raw_path)
-                if not normalized or normalized in seen_paths:
+                if not normalized:
+                    continue
+                if self.media_resolver is not None:
+                    resolution = self.media_resolver.resolve(
+                        raw_path,
+                        record=record,
+                        side=side,
+                        default_kind=COMPARISON_KIND,
+                    )
+                    if not resolution.available:
+                        continue
+                    path = Path(resolution.resolved_path)
+                    normalized = _normalized_path(path)
+                else:
+                    path = Path(raw_path)
+                if normalized in seen_paths:
                     continue
                 seen_paths.add(normalized)
-                path = Path(raw_path)
                 stat = _safe_stat(path)
                 if stat is None:
                     continue
@@ -281,7 +309,7 @@ class RetentionManager:
                     history_number=history_number,
                     duel_id=duel_id,
                     side=side,
-                    original_path=raw_path,
+                    original_path=str(path),
                     size_bytes=int(stat.st_size),
                     duel_timestamp=timestamp,
                     reason="",

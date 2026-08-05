@@ -248,6 +248,8 @@ from generation_profiles import (
     snapshot_profile,
 )
 
+from historical_media import COMPARISON_KIND, HistoricalMediaResolver
+
 
 # Policy/theme configuration is read from the actual imported config module.
 # Each field has its own fallback, so one missing optional setting cannot silently
@@ -658,6 +660,10 @@ ARTIST_PORTRAITS_FILE = DATA_LAYOUT.path("artist_portraits_file")
 ARTIST_PORTRAITS_DIR = DATA_LAYOUT.path("artist_portraits_dir")
 TOP50_ENTRY_FILE = DATA_LAYOUT.path("top50_entry_file")
 FAVORITE_DUEL_ARCHIVE_DIR = DATA_LAYOUT.path("favorite_duel_archive_dir")
+HISTORICAL_MEDIA_RESOLVER = HistoricalMediaResolver(
+    COMPARISON_IMAGES_DIR,
+    FAVORITE_DUEL_ARCHIVE_DIR,
+)
 TOP50_RECENT_BADGE_DUELS = 100
 
 # Bind to all local interfaces so another device on the same Wi-Fi/LAN can open
@@ -3908,13 +3914,17 @@ class FavoritesStore:
             for entry in self.data["image"].values():
                 path = str(entry.get("metadata", {}).get("path", "") or entry.get("key", ""))
                 if path:
-                    protected.add(str(Path(path)))
+                    resolution = HISTORICAL_MEDIA_RESOLVER.resolve(path)
+                    if resolution.available:
+                        protected.add(resolution.resolved_path)
             for entry in self.data["duel"].values():
                 metadata = entry.get("metadata", {})
                 for field_name in ("image_a_path", "image_b_path"):
                     path = str(metadata.get(field_name, ""))
                     if path:
-                        protected.add(str(Path(path)))
+                        resolution = HISTORICAL_MEDIA_RESOLVER.resolve(path)
+                        if resolution.available:
+                            protected.add(resolution.resolved_path)
         return protected
 
 
@@ -5356,11 +5366,36 @@ GENERATION_ANALYTICS_HEAD = r"""
 </script>
 """
 
-def gallery_thumbnail_path(original_path: str, force_full_resolution: bool = False) -> Optional[str]:
+def gallery_original_path(record: dict, side: str) -> Optional[str]:
+    """Resolve one historical original without rewriting the stored record."""
+    normalized_side = "B" if str(side or "A").strip().upper() == "B" else "A"
+    field = "image_b_path" if normalized_side == "B" else "image_a_path"
+    resolution = HISTORICAL_MEDIA_RESOLVER.resolve(
+        record.get(field, ""),
+        record=record,
+        side=normalized_side,
+        default_kind=COMPARISON_KIND,
+    )
+    return resolution.resolved_path if resolution.available else None
+
+
+def gallery_thumbnail_path(
+    original_path: str,
+    force_full_resolution: bool = False,
+    *,
+    record: Optional[dict] = None,
+    side: Optional[str] = None,
+) -> Optional[str]:
     """Return a cached lightweight gallery preview, or the original on fallback."""
-    path = Path(str(original_path or ""))
-    if not path.exists() or not path.is_file():
+    resolution = HISTORICAL_MEDIA_RESOLVER.resolve(
+        original_path,
+        record=record,
+        side=side,
+        default_kind=COMPARISON_KIND,
+    )
+    if not resolution.available:
         return None
+    path = Path(resolution.resolved_path)
     if force_full_resolution or PILImage is None:
         return str(path)
     try:
@@ -5385,13 +5420,19 @@ def gallery_thumbnail_path(original_path: str, force_full_resolution: bool = Fal
 def gallery_record_preview(record: dict, side: str, force_full_resolution: bool = False) -> Optional[str]:
     """Return a historical original or its retained thumbnail after cleanup."""
     normalized_side = "b" if str(side or "A").strip().upper() == "B" else "a"
-    original = Path(str(record.get(f"image_{normalized_side}_path", "") or ""))
+    original_text = gallery_original_path(record, normalized_side)
+    original = Path(original_text) if original_text else None
     if force_full_resolution:
-        return str(original) if original.is_file() else None
+        return str(original) if original is not None and original.is_file() else None
     thumbnail = Path(str(record.get(f"image_{normalized_side}_thumbnail_path", "") or ""))
     if thumbnail.is_file():
         return str(thumbnail)
-    return gallery_thumbnail_path(str(original), False)
+    return gallery_thumbnail_path(
+        str(record.get(f"image_{normalized_side}_path", "") or ""),
+        False,
+        record=record,
+        side=normalized_side,
+    )
 
 
 def gallery_record_preview_exists(record: dict, side: str) -> bool:
@@ -5401,8 +5442,7 @@ def gallery_record_preview_exists(record: dict, side: str) -> bool:
     thumbnail generation is deferred until a specific duel is opened.
     """
     normalized_side = "b" if str(side or "A").strip().upper() == "B" else "a"
-    original = Path(str(record.get(f"image_{normalized_side}_path", "") or ""))
-    if original.is_file():
+    if gallery_original_path(record, normalized_side):
         return True
     thumbnail = Path(str(record.get(f"image_{normalized_side}_thumbnail_path", "") or ""))
     return thumbnail.is_file()
@@ -5412,13 +5452,18 @@ def gallery_record_retention_status(record: dict) -> str:
     """Summarize whether full-resolution historical originals remain retained."""
     statuses: List[str] = []
     for side in ("a", "b"):
-        original = Path(str(record.get(f"image_{side}_path", "") or ""))
-        if original.is_file():
+        resolution = HISTORICAL_MEDIA_RESOLVER.resolve(
+            record.get(f"image_{side}_path", ""),
+            record=record,
+            side=side,
+            default_kind=COMPARISON_KIND,
+        )
+        if resolution.available:
             statuses.append("original")
             continue
         status = str(record.get(f"image_{side}_retention_status", "") or "").strip().casefold()
         thumbnail = Path(str(record.get(f"image_{side}_thumbnail_path", "") or ""))
-        if status == "quarantined":
+        if resolution.status == "retention_removed" and status == "quarantined":
             statuses.append("recovery")
         elif thumbnail.is_file():
             statuses.append("thumbnail")
@@ -8563,7 +8608,7 @@ class ArtistELORanker:
         self.retention_cleanup_lock = threading.Lock()
         self.retention_worker_stop = threading.Event()
         self.retention_manager = RetentionManager(
-            RETENTION_QUARANTINE_DIR, RETENTION_STATE_FILE
+            RETENTION_QUARANTINE_DIR, RETENTION_STATE_FILE, COMPARISON_IMAGES_DIR
         )
 
         # Ensure output directory exists, then restore any ready duels from disk.
@@ -12413,6 +12458,7 @@ class ArtistELORanker:
         try:
             with self.state_lock:
                 history_copy = [dict(record) for record in self.history.records]
+            HISTORICAL_MEDIA_RESOLVER.prime_history(history_copy)
             records: List[dict] = []
             for history_index, record in enumerate(history_copy):
                 artists_a = list(record.get("artists_a", []))
@@ -12421,7 +12467,10 @@ class ArtistELORanker:
                 duel_id = stable_duel_id(record)
                 image_a = str(record.get("image_a_path", ""))
                 image_b = str(record.get("image_b_path", ""))
-                originals_available = Path(image_a).is_file() and Path(image_b).is_file()
+                originals_available = bool(
+                    gallery_original_path(record, "A")
+                    and gallery_original_path(record, "B")
+                )
                 images_available = bool(
                     gallery_record_preview_exists(record, "A")
                     and gallery_record_preview_exists(record, "B")
@@ -13383,8 +13432,8 @@ class ArtistELORanker:
             "image_a_path": image_a_path,
             "image_b_path": image_b_path,
             "image_retention_status": gallery_record_retention_status(record),
-            "image_a_original_retained": Path(image_a_path).is_file(),
-            "image_b_original_retained": Path(image_b_path).is_file(),
+            "image_a_original_retained": bool(gallery_original_path(record, "A")),
+            "image_b_original_retained": bool(gallery_original_path(record, "B")),
             "expected_a": float(record.get("top_search_expected_a", 0.5) or 0.5),
             "image_a_available": bool(preview_a),
             "image_b_available": bool(preview_b),
@@ -24180,8 +24229,8 @@ def _dedicated_gallery_list_payload(
         history_record = ranker._history_record_by_number(history_number) or {}
         image_a_available = bool(gallery_record_preview(history_record, "A", False))
         image_b_available = bool(gallery_record_preview(history_record, "B", False))
-        image_a_original_retained = Path(str(history_record.get("image_a_path", "") or "")).is_file()
-        image_b_original_retained = Path(str(history_record.get("image_b_path", "") or "")).is_file()
+        image_a_original_retained = bool(gallery_original_path(history_record, "A"))
+        image_b_original_retained = bool(gallery_original_path(history_record, "B"))
         size_a = len(list(record.get("artists_a", []) or []))
         size_b = len(list(record.get("artists_b", []) or []))
         size_names = {1: "Solo", 2: "Duo", 3: "Trio"}
