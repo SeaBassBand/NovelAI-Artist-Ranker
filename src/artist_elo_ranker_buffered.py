@@ -1345,7 +1345,7 @@ RECENT_ARTIST_MEMORY = 1600
 # SHAREABLE_EDITION_SECURE_CONFIGURATION_V190
 # API credentials are never embedded or read from config.py. They live only in
 # Windows Credential Manager and are fetched only when a NovelAI session is needed.
-SHAREABLE_EDITION_VERSION = "2.6.1"
+SHAREABLE_EDITION_VERSION = "2.6.2"
 GITHUB_REPOSITORY = "SeaBassBand/NovelAI-Artist-Ranker"
 # SHAREABLE_EDITION_GENERATION_PROFILES_V202
 # SHAREABLE_EDITION_STORAGE_RETENTION_V211
@@ -14943,7 +14943,7 @@ class ArtistELORanker:
         )
 
 # DEDICATED_RANKER_STYLE_REPAIR_V4
-        with gr.Blocks(title="Artist ELO Ranker") as app:
+        with gr.Blocks(title="Artist ELO Ranker", analytics_enabled=False) as app:
             gr.HTML(
                 "<style>" + PHASE3_CSS + str(globals().get("QOL_ACCELERATOR_CSS", ""))
                 + DEDICATED_RANKER_MOUNT_SAFETY_CSS + SECURE_SETUP_CSS + "</style>",

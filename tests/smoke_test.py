@@ -56,7 +56,7 @@ assert "reset --hard" not in source_updater.casefold()
 launcher_source = (ROOT / "packaging" / "public_launcher.pyw").read_text(encoding="utf-8")
 install_source = (ROOT / "packaging" / "install_public.ps1").read_text(encoding="utf-8")
 visible_source = (ROOT / "packaging" / "run_visible.ps1").read_text(encoding="utf-8")
-assert 'APP_VERSION = "2.6.1"' in launcher_source
+assert 'APP_VERSION = "2.6.2"' in launcher_source
 assert "user_paths.json" in launcher_source + install_source + visible_source
 assert 'ForEach-Object { $_.ToString() }' in visible_source
 assert '$ErrorActionPreference = "Continue"' in visible_source
@@ -67,13 +67,29 @@ for name in (
 ):
     assert (ROOT / name).is_file(), name
 
+readme_source = (ROOT / "README.md").read_text(encoding="utf-8")
+for section in (
+    "Creator's preface", "Installation options", "What it does", "Your data, your rules",
+    "Phone voting and the optional Android app", "Privacy, security, and network behavior",
+):
+    assert section in readme_source, section
+for name in (
+    "intro-artist-ranking.webp", "desktop-duel.webp", "mobile-duel.webp",
+    "mobile-voting-gestures.webp", "phone-pairing-lan.webp",
+):
+    image_path = ROOT / "docs" / "images" / name
+    assert image_path.is_file() and image_path.stat().st_size > 10_000, name
+    data = image_path.read_bytes()
+    assert data[:4] == b"RIFF" and data[8:12] == b"WEBP", name
+
 main_source = (SRC / "artist_elo_ranker_buffered.py").read_text(encoding="utf-8")
 recovery_source = (SRC / "backup_transfer_recovery.py").read_text(encoding="utf-8")
 guidance_source = (SRC / "onboarding_guidance.py").read_text(encoding="utf-8")
 builder_source = (ROOT / "packaging" / "build_public_release.py").read_text(encoding="utf-8")
-assert 'SHAREABLE_EDITION_VERSION = "2.6.1"' in main_source
+assert 'SHAREABLE_EDITION_VERSION = "2.6.2"' in main_source
 assert "SOURCE_INSTALL_MODE" in main_source
 assert "Update and Start.bat" in main_source
+assert 'gr.Blocks(title="Artist ELO Ranker", analytics_enabled=False)' in main_source
 assert 'GITHUB_REPOSITORY = "SeaBassBand/NovelAI-Artist-Ranker"' in main_source
 assert 'DEFAULT_GITHUB_REPOSITORY = "SeaBassBand/NovelAI-Artist-Ranker"' in recovery_source
 assert "example.invalid" not in main_source + recovery_source

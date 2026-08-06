@@ -14,7 +14,7 @@ import tempfile
 import time
 import zipfile
 
-APP_VERSION = "2.6.1"
+APP_VERSION = "2.6.2"
 ANDROID_VERSION = "1.5.1"
 ANDROID_CODE = 12
 RELEASE_FOLDER = f"NovelAI-Artist-Ranker-v{APP_VERSION}"

@@ -1,10 +1,10 @@
-# NovelAI Artist Ranker 2.6.1
+# NovelAI Artist Ranker 2.6.2
 
-This patch fixes Gallery and Favorites access to historical images after moving an installation or data folder. It also adds an optional GitHub source installation with a private Python environment, external data folder, and safe fast-forward-only updates from the `release` branch.
+This privacy-and-documentation patch introduces the complete public README and explicitly disables Gradio framework analytics.
 
-- Setup can install on D: or another chosen drive and remembers that Program location.
-- Real GitHub update checks, verified Windows update packages, stable/beta channels, and optional automatic checks.
-- External scheduled backups, size/free-space previews, count/space retention, deep integrity audits, and portrait provenance.
-- A streamlined Maintenance Center with low-frequency preferences moved into Settings.
-- Safer redacted diagnostic bundles and a last-200-lines sanitized log command.
-- Android 1.5.1 handles `artist-ranker://pair` QR links, authenticates the buffer monitor, and can download the matching or latest verified APK.
+- Documents Setup, Portable, source-clone, Update ZIP, phone-browser, and optional signed-APK workflows.
+- Explains ranking, matchmaking, generation, Gallery, Favorites, retention, backup, transfer, integrity, update, and pairing controls.
+- Adds five cropped, metadata-stripped project images, including an anonymized pairing screen with nonfunctional demo credentials.
+- Clarifies the local security model, lack of any maintainer-operated backend, and every optional network exception.
+- Keeps the Gallery relocation fix and safe `release`-branch source installer introduced in 2.6.1.
+- Android remains version 1.5.1 / code 12 with the same signing identity.

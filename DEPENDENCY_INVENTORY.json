@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "application": "NovelAI Artist Ranker",
-  "version": "2.6.1",
+  "version": "2.6.2",
   "python": [
     {
       "name": "annotated-doc",
