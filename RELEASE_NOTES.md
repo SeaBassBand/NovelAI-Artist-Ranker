@@ -1,4 +1,6 @@
-# NovelAI Artist Ranker 2.6.0
+# NovelAI Artist Ranker 2.6.1
+
+This patch fixes Gallery and Favorites access to historical images after moving an installation or data folder. It also adds an optional GitHub source installation with a private Python environment, external data folder, and safe fast-forward-only updates from the `release` branch.
 
 - Setup can install on D: or another chosen drive and remembers that Program location.
 - Real GitHub update checks, verified Windows update packages, stable/beta channels, and optional automatic checks.

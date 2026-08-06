@@ -2,7 +2,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.source-install/
 .env
+src/config.py
 Data/
 data/
 comparison_images/

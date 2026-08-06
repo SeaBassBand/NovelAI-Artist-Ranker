@@ -17,7 +17,7 @@ import webbrowser
 import winreg
 
 APP_NAME = "NovelAI Artist Ranker"
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.6.1"
 SERVER = "http://127.0.0.1:7860"
 MUTEX_NAME = r"Local\NovelAIArtistRankerLauncher"
 AUTOSTART_VALUE = "NovelAI Artist Ranker"

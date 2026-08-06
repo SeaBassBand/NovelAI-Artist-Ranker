@@ -12,4 +12,6 @@ jobs:
           python-version: '3.11'
       - run: python tests/smoke_test.py
       - run: python tests/transfer_portability_test.py
+      - run: python tests/historical_media_test.py
       - run: python tests/phase9_maintenance_test.py
+      - run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/source_install_test.ps1 -PythonExecutable python

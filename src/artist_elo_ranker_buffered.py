@@ -153,7 +153,15 @@ from backup_transfer_recovery import (
     process_pending_update_bootstrap,
 )
 
-_PHASE7_BOOTSTRAP_MESSAGE = process_pending_update_bootstrap(Path(__file__).resolve().parent)
+_BOOTSTRAP_PROGRAM_DIR = Path(__file__).resolve().parent
+SOURCE_INSTALL_ROOT = _BOOTSTRAP_PROGRAM_DIR.parent
+SOURCE_INSTALL_MODE = (
+    os.environ.get("ARTIST_RANKER_SOURCE_INSTALL", "").strip() == "1"
+    or (SOURCE_INSTALL_ROOT / ".git").is_dir()
+)
+_PHASE7_BOOTSTRAP_MESSAGE = (
+    "" if SOURCE_INSTALL_MODE else process_pending_update_bootstrap(_BOOTSTRAP_PROGRAM_DIR)
+)
 
 from config import (
     ARTIST_TAGS_FILE,
@@ -1337,7 +1345,7 @@ RECENT_ARTIST_MEMORY = 1600
 # SHAREABLE_EDITION_SECURE_CONFIGURATION_V190
 # API credentials are never embedded or read from config.py. They live only in
 # Windows Credential Manager and are fetched only when a NovelAI session is needed.
-SHAREABLE_EDITION_VERSION = "2.6.0"
+SHAREABLE_EDITION_VERSION = "2.6.1"
 GITHUB_REPOSITORY = "SeaBassBand/NovelAI-Artist-Ranker"
 # SHAREABLE_EDITION_GENERATION_PROFILES_V202
 # SHAREABLE_EDITION_STORAGE_RETENTION_V211
@@ -8968,7 +8976,7 @@ class ArtistELORanker:
 
     def version_status_markdown(self) -> str:
         channel = str(self.storage_settings.get("update_channel", "stable") or "stable")
-        pending = (PROGRAM_DIR / ".artist_ranker_pending_update.json").exists()
+        pending = (not SOURCE_INSTALL_MODE) and (PROGRAM_DIR / ".artist_ranker_pending_update.json").exists()
         last_check = float(self.storage_settings.get("update_last_check_epoch", 0.0) or 0.0)
         last_check_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(last_check)) if last_check else "Never"
         last_backup = max(
@@ -8984,13 +8992,15 @@ class ArtistELORanker:
         return (
             "### Installed components\n"
             f"**Windows/server:** `{SHAREABLE_EDITION_VERSION}`  \n"
+            f"**Install type:** `{'GitHub source clone' if SOURCE_INSTALL_MODE else 'Windows release package'}`  \n"
             f"**Android package:** `{ANDROID_APP_VERSION}` (`{ANDROID_APP_VERSION_CODE}`)  \n"
             f"**Pairing protocol:** `{PAIRING_PROTOCOL_VERSION}`  \n"
             f"**Data schema:** `{DATA_SCHEMA_VERSION}` · **layout schema:** `{DATA_LAYOUT_SCHEMA_VERSION}`  \n"
             f"**Update channel:** `{channel}`  \n"
             f"**Last GitHub check:** `{last_check_text}`  \n"
             f"**Last backup:** `{backup_state}`  \n"
-            f"**Scheduled update:** `{'Ready for restart' if pending else 'None'}`  \n"
+            f"**Update method:** `{'Update and Start.bat (git pull --ff-only)' if SOURCE_INSTALL_MODE else 'Verified release ZIP'}`  \n"
+            f"**Scheduled update:** `{'Not used for source clones' if SOURCE_INSTALL_MODE else ('Ready for restart' if pending else 'None')}`  \n"
             f"**Program folder:** `{PROGRAM_DIR}`  \n"
             f"**Data folder:** `{DATA_ROOT}`  \n"
             f"**Backup folder:** `{self.transfer_recovery.backup_root}`"
@@ -9043,6 +9053,12 @@ class ArtistELORanker:
         choice = str(source or "matching").casefold()
         if choice == "matching":
             if not ANDROID_APK_PATH.is_file():
+                if SOURCE_INSTALL_MODE:
+                    payload = str(release_payload or "")
+                    if not payload:
+                        _report, payload = self.transfer_recovery.github_release_status(channel)
+                    status, path = self.transfer_recovery.download_github_asset(payload, "apk")
+                    return status, gr.update(value=str(path) if path else None, visible=bool(path))
                 return "❌ The matching Android APK is not present in this installation.", gr.update(value=None, visible=False)
             return (
                 f"✅ Matching Android `{ANDROID_APP_VERSION}` APK is ready. Open the file control below to save it.",
@@ -9055,6 +9071,12 @@ class ArtistELORanker:
         return status, gr.update(value=str(path) if path else None, visible=bool(path))
 
     def prepare_github_update(self, channel: Any, release_payload: Any) -> Tuple[str, Any, str, str, bool]:
+        if SOURCE_INSTALL_MODE:
+            return (
+                "ℹ️ This is a GitHub source installation. Close the Ranker, then run `Update and Start.bat`; "
+                "it accepts only a clean `release` branch and a fast-forward-only Git pull.",
+                gr.update(value=None, visible=False), "", "", False,
+            )
         payload = str(release_payload or "")
         if not payload:
             _report, payload = self.transfer_recovery.github_release_status(channel)
@@ -16507,8 +16529,13 @@ class ArtistELORanker:
 
                         with gr.Accordion("Safe application updates", open=False):
                             gr.Markdown(
-                                "Update packages are inspected before scheduling. The next startup applies only checksum-listed files, "
-                                "after a complete program/metadata restore point has been created. A failed application rolls back changed files."
+                                (
+                                    "This source installation updates through `Update and Start.bat`. Close the Ranker first; the updater "
+                                    "requires a clean `release` branch and performs only `git pull --ff-only`. Your data folder is outside Git."
+                                    if SOURCE_INSTALL_MODE else
+                                    "Update packages are inspected before scheduling. The next startup applies only checksum-listed files, "
+                                    "after a complete program/metadata restore point has been created. A failed application rolls back changed files."
+                                )
                             )
                             update_channel = gr.Radio(
                                 choices=[("Stable releases", "stable"), ("Beta / prerelease", "beta")],
@@ -16528,7 +16555,10 @@ class ArtistELORanker:
                                 update_check_settings_btn = gr.Button("Save update-check settings")
                             with gr.Row():
                                 update_feed_check_btn = gr.Button("Check GitHub for updates", variant="primary")
-                                update_download_btn = gr.Button("Download verified Windows update")
+                                update_download_btn = gr.Button(
+                                    "Use Update and Start.bat" if SOURCE_INSTALL_MODE else "Download verified Windows update",
+                                    interactive=not SOURCE_INSTALL_MODE,
+                                )
                             update_feed_report = gr.Markdown(
                                 str(self.storage_settings.get("update_last_check_report", "") or (
                                     f"Updates are checked against [{GITHUB_REPOSITORY}](https://github.com/{GITHUB_REPOSITORY}/releases). "
@@ -16542,16 +16572,23 @@ class ArtistELORanker:
                             )
                             update_download_status = gr.Markdown("")
                             update_package_file = gr.File(
-                                label="Artist Ranker update ZIP", file_types=[".zip"], type="filepath"
+                                label="Artist Ranker update ZIP", file_types=[".zip"], type="filepath",
+                                visible=not SOURCE_INSTALL_MODE,
                             )
-                            update_preview_btn = gr.Button("Preview update package — no changes")
+                            update_preview_btn = gr.Button(
+                                "Preview update package — no changes", visible=not SOURCE_INSTALL_MODE
+                            )
                             update_preview_report = gr.Markdown("")
                             update_plan = gr.Textbox(visible=False, elem_classes=["legacy-hidden-editor"])
                             update_confirm = gr.Checkbox(
                                 label="I reviewed this update and approve scheduling it for the next restart",
                                 value=False,
+                                visible=not SOURCE_INSTALL_MODE,
                             )
-                            update_schedule_btn = gr.Button("Create restore point and schedule update", variant="primary")
+                            update_schedule_btn = gr.Button(
+                                "Create restore point and schedule update", variant="primary",
+                                visible=not SOURCE_INSTALL_MODE,
+                            )
                             update_status = gr.Markdown("")
 
                     with gr.Accordion("Temporary cache cleanup", open=False):
@@ -16747,6 +16784,8 @@ class ArtistELORanker:
                 return self.prepare_android_apk(source, channel, release_payload)
 
             def on_update_preview(upload):
+                if SOURCE_INSTALL_MODE:
+                    return "ℹ️ Source clones update only through `Update and Start.bat`.", "", False
                 try:
                     report, plan = self.transfer_recovery.preview_update(upload)
                     return report, plan, False
@@ -16754,6 +16793,8 @@ class ArtistELORanker:
                     return f"❌ Update preview failed: {type(exc).__name__}: {exc}", "", False
 
             def on_update_schedule(plan, confirmed):
+                if SOURCE_INSTALL_MODE:
+                    return "ℹ️ Source clones do not schedule binary updates. Use `Update and Start.bat`.", False
                 return self.transfer_recovery.schedule_update(plan, confirmed), False
 
             def _selected_table_row(table_data, evt):

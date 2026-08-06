@@ -35,10 +35,28 @@ for name in ("build_public_release.py", "public_launcher.pyw", "uninstall.pyw"):
 for name in ("install_public.ps1", "launcher_guard.ps1", "run_visible.ps1", "copy_recent_logs.ps1"):
     assert (ROOT / "packaging" / name).is_file(), name
 
+for name in (
+    "Install.bat", "Start.bat", "Update and Start.bat",
+    "Install-from-source.ps1", "Update-source.ps1", "SOURCE_INSTALL.md",
+):
+    assert (ROOT / name).is_file(), name
+assert (SRC / "danbooru_artist_tags_v4.5.txt").is_file()
+
+source_installer = (ROOT / "Install-from-source.ps1").read_text(encoding="utf-8")
+source_updater = (ROOT / "Update-source.ps1").read_text(encoding="utf-8")
+assert 'ARTIST_RANKER_SOURCE_INSTALL = "1"' in source_installer
+assert "ARTIST_RANKER_DATA_DIR" in source_installer
+assert 'Join-Path $RepoRoot ".venv"' in source_installer
+assert "requirements.sha256" in source_installer
+assert '"release"' in source_updater
+assert "status --porcelain" in source_updater
+assert '"pull", "--ff-only"' in source_updater
+assert "reset --hard" not in source_updater.casefold()
+
 launcher_source = (ROOT / "packaging" / "public_launcher.pyw").read_text(encoding="utf-8")
 install_source = (ROOT / "packaging" / "install_public.ps1").read_text(encoding="utf-8")
 visible_source = (ROOT / "packaging" / "run_visible.ps1").read_text(encoding="utf-8")
-assert 'APP_VERSION = "2.6.0"' in launcher_source
+assert 'APP_VERSION = "2.6.1"' in launcher_source
 assert "user_paths.json" in launcher_source + install_source + visible_source
 assert 'ForEach-Object { $_.ToString() }' in visible_source
 assert '$ErrorActionPreference = "Continue"' in visible_source
@@ -53,7 +71,9 @@ main_source = (SRC / "artist_elo_ranker_buffered.py").read_text(encoding="utf-8"
 recovery_source = (SRC / "backup_transfer_recovery.py").read_text(encoding="utf-8")
 guidance_source = (SRC / "onboarding_guidance.py").read_text(encoding="utf-8")
 builder_source = (ROOT / "packaging" / "build_public_release.py").read_text(encoding="utf-8")
-assert 'SHAREABLE_EDITION_VERSION = "2.6.0"' in main_source
+assert 'SHAREABLE_EDITION_VERSION = "2.6.1"' in main_source
+assert "SOURCE_INSTALL_MODE" in main_source
+assert "Update and Start.bat" in main_source
 assert 'GITHUB_REPOSITORY = "SeaBassBand/NovelAI-Artist-Ranker"' in main_source
 assert 'DEFAULT_GITHUB_REPOSITORY = "SeaBassBand/NovelAI-Artist-Ranker"' in recovery_source
 assert "example.invalid" not in main_source + recovery_source

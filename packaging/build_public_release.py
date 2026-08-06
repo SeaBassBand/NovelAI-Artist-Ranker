@@ -14,7 +14,7 @@ import tempfile
 import time
 import zipfile
 
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.6.1"
 ANDROID_VERSION = "1.5.1"
 ANDROID_CODE = 12
 RELEASE_FOLDER = f"NovelAI-Artist-Ranker-v{APP_VERSION}"
@@ -585,6 +585,10 @@ def copy_repo_template(payload_root: Path, release: Path, requirements: str) -> 
             shutil.copy2(source, destination)
     assets = runtime_assets_root(payload_root)
     shutil.copy2(assets / "config.py", program / "config.example.py")
+    artist_tags = source_root / "danbooru_artist_tags_v4.5.txt"
+    if not artist_tags.is_file():
+        raise FileNotFoundError(f"Source-install artist list was not found: {artist_tags}")
+    shutil.copy2(artist_tags, program / artist_tags.name)
     packaging_dir = target / "packaging"
     packaging_dir.mkdir(parents=True, exist_ok=True)
     for name in (

@@ -7,13 +7,15 @@ A local blind-comparison ranker for NovelAI artist tags, with desktop and paired
 Download the current release assets:
 
 - `NovelAI-Artist-Ranker-Setup.exe`
-- `NovelAI-Artist-Ranker-Portable-v2.6.0.zip`
-- `NovelAI-Artist-Ranker-Update-v2.6.0.zip`
+- `NovelAI-Artist-Ranker-Portable-v2.6.1.zip`
+- `NovelAI-Artist-Ranker-Update-v2.6.1.zip`
 - `artist-ranker.apk`
 - `SHA256SUMS.txt`
 - `RELEASE_NOTES.md`
 
 The Windows packages include their own Python runtime. End users do not need Python, Git, Java, Gradle, or an Android SDK. The normal launcher keeps a visible log window open; closing that window stops the ranker. A background/tray launcher is included as an alternative.
+
+An optional GitHub/Python installation is documented in [`SOURCE_INSTALL.md`](SOURCE_INSTALL.md). The comprehensive README rewrite is planned separately.
 
 ## First run
 
