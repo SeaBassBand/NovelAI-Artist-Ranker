@@ -8,8 +8,10 @@ Also this project should with very little tweaking work with Anima local generat
 
 NovelAI Artist Ranker aims to help you discover strong and appealing artists tag tailored to you, by turning the task into a repeatable simple blind-comparison workflow. It generates controlled A/B image duels, records your choices, and gradually builds personal rankings for individual artist tags and artist combinations. The statistics do the remembering; your only job is to judge two pictures with unreasonable seriousness.
 
+Votes use an Elo-style expected-result calculation, so an upset moves more points than an expected win. Matchmaking favors comparisons likely to teach the system something while mixing in discovery, follow-ups, and verification and avoiding recent repeats. [See the short technical explanation](#how-scoring-and-matchmaking-work).
+
 <p align="center">
-  <img src="docs/images/intro-artist-ranking.webp" alt="Illustration of a focused user comparing generated images at a desktop computer" width="100%">
+  <img src="docs/images/intro-artist-ranking.webp" alt="Illustration of a focused user comparing generated images at a desktop computer" width="60%">
 </p>
 
 Everything runs on your own Windows computer. Your API key, prompts, images, rankings, favorites, history, and backups remain under your control. A phone can join over your local network, but the Android app is entirely optional—the desktop interface and a normal phone browser work without it.
@@ -160,6 +162,12 @@ Release packages are scanned to exclude credentials, pairing state, user data, p
 
 See [SECURITY.md](SECURITY.md) for the concise security policy.
 
+## How scoring and matchmaking work
+
+Every artist begins at 1500 points. For an A/B result, the Ranker estimates each side's chance of winning from the rating difference, then applies a 32-point Elo adjustment: an expected win produces a small change, while an upset produces a larger one. A tie aims at a 0.5 result and therefore pulls unequal ratings closer together. Ratings are tracked overall and separately for solo, duo, and trio appearances; exact combinations also have their own ratings. If an artist appears on both sides, that shared artist is treated as neutral. Both bad and Invalid duel are recorded for history and diagnostics but do not count as a competitive win or loss.
+
+Matchmaking scores possible duels by expected information, which is highest when the predicted outcome is near 50/50. It also schedules fresh discovery, opening and recovery follow-ups, ranking-boundary checks, stale recalls, bridge comparisons, and elite verification. Recent artists, exact matchups, repeated combinations, and anything already waiting in the generation buffer are penalized or excluded. The two images use the same seed and controlled settings so the vote is more informative about the artist tags rather than random composition differences.
+
 ## Updating safely
 
 Packaged installations can check GitHub from Maintenance, download the matching Update ZIP, preview its contents, and schedule it. The next startup applies only checksum-listed files after creating a restore point; a failed application attempts to roll back changed files.
@@ -184,6 +192,6 @@ The public release builder produces Setup, Portable, Update, APK, dependency inv
 
 ## License and content
 
-See [LICENSE](LICENSE) for the project license and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled components. NovelAI and related names belong to their respective owners. Users are responsible for their NovelAI account, generated content, selected artist tags, external links, and compliance with applicable service terms and laws.
+The project uses the [Zero-Clause BSD license](LICENSE): you may use, copy, modify, and redistribute it for any purpose, with or without payment, and without an attribution requirement. Bundled third-party components retain their own terms listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). NovelAI and related names belong to their respective owners. Users are responsible for their NovelAI account, generated content, selected artist tags, external links, and compliance with applicable service terms and laws.
 
 README screenshots are cropped, re-encoded, and stripped of embedded metadata. Pairing credentials shown here are nonfunctional demo values.
