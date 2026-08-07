@@ -37,10 +37,27 @@ The system does considerably more than keep a single score:
 - **Purposeful matchmaking.** Balance fresh discovery, close-rating comparisons, newcomer challenges, follow-ups, boundary checks, verification, and exploration while penalizing recent repeats.
 - **Buffered generation.** Keep a configurable queue of ready duels so voting can continue while replacement images generate in the background.
 - **Controlled image generation.** Manage positive and negative prompts, saved prompt presets, generation profiles, per-duel prompt rotation, model settings, samplers, steps, dimensions, and related NovelAI options.
+- **Optional local Anima generation.** Use a separate Local/Anima archive with an existing ComfyUI or Forge/Neo Forge endpoint. The Ranker can scan common local endpoints, lets you connect manually, and can show native generation previews in the normal duel cards for the first 0-10 buffered duels. Local and NovelAI ladders, prompts, tags, buffers, and history stay separate when you switch modes.
 - **Inspectable results.** Browse artist and combination ladders, reveal tags after voting, open artist details, review rating changes, and undo or redo recent decisions.
 - **A real history Gallery.** Search and filter previous duels, inspect full generation snapshots, switch between thumbnails and original images, and continue resolving historical images after moving the application or Data folder.
 - **Favorites and notes.** Save artists, combinations, individual images, or complete duels; attach notes and organize material you want to revisit.
 - **Local session statistics.** Monitor buffer state, pace, coverage, generation reliability, and timing without sending those analytics to the project maintainer.
+
+### Convenience features
+
+Right-click an artist name for notes, favorites, portraits, external searches, and copy formats. The copy submenu keeps the formats in a predictable order: NovelAI syntax, Anima syntax, raw name, then booru tag. This makes it quick to move a winning artist into the prompt editor or a local-generation workflow.
+
+<p align="center">
+  <img src="docs/images/artist-copy-convenience.webp" alt="Artist context menu with copy, search, portrait, favorite, and tagging convenience actions" width="55%">
+</p>
+
+### Artist ladder
+
+The ladder is more than a sorted name list. It combines portraits, categories and manual tags with conservative Top-search score, potential, uncertainty, Top-50 probability, stage, duel count, record, score rate, weighted win rate, and confidence. It is paged and searchable, and opening an artist takes you to the related Gallery history and actions.
+
+<p align="center">
+  <img src="docs/images/artist-ladder.webp" alt="Artist ladder showing portraits, categories, Bayesian scores, potential, records, rates, and confidence" width="100%">
+</p>
 
 ## Installation options
 
@@ -51,6 +68,7 @@ Download official packages from the [latest GitHub Release](https://github.com/S
 | **Windows Setup** (`NovelAI-Artist-Ranker-Setup.exe`) | Most users | Windows and NovelAI API access | Installs the self-contained app, lets you choose the program drive, and creates normal launch/uninstall entries. Python and runtime dependencies are included. | Use the Ranker's verified update workflow or install a newer Setup release. |
 | **Portable ZIP** (`NovelAI-Artist-Ranker-Portable-vX.Y.Z.zip`) | Removable drives, isolated folders, or no formal installation | Windows and NovelAI API access | Extract anywhere writable and launch from that folder. It includes the same private Python runtime and does not require system Python, Git, Java, Gradle, or an Android SDK. | Replace it with a newer Portable ZIP or use the verified Update ZIP workflow. Keep Data outside the replaceable program folder when practical. |
 | **GitHub source installation** | Contributors and users who prefer Git-based updates | Windows, **Python 3.11**, and Git for Windows | Clones the stable `release` branch, creates a repository-local `.venv`, installs the locked dependencies, creates local configuration, and places user data outside Git. | Close the Ranker and run `Update and Start.bat`. It refuses dirty working trees and performs only `git pull --ff-only`. |
+| **Local Anima mode** | Users with a local ComfyUI or Forge/Neo Forge setup | A running local diffuser endpoint and an Anima-compatible workflow/model | Enable Local/Anima in Maintenance, choose a detected endpoint or enter its URL, then configure the workflow/API bindings and generation profile. This is optional; NovelAI mode remains unchanged and uses its own archive. | Keep the diffuser endpoint updated separately. The Ranker stores local-generation settings and results in the Local/Anima archive. |
 | **Update ZIP** (`NovelAI-Artist-Ranker-Update-vX.Y.Z.zip`) | An existing Setup or Portable installation | A compatible installed release | This is **not a first-time installer**. The Ranker inspects its manifest and checksums, creates a restore point, and schedules the update for the next startup. | Built specifically for the safe in-app packaged-update workflow. Source clones never apply it over tracked files. |
 
 ### Recommended: Windows Setup
@@ -156,6 +174,8 @@ There are a few transparent, user-controlled exceptions:
 - **External artist searches:** choosing an external search action can open Gelbooru, Rule34, or Google in your normal browser. These sites are not contacted merely by ranking images.
 
 Your NovelAI credential is stored through Windows Credential Manager and is retrieved only when a NovelAI session is needed. Secret-management and launcher-control endpoints accept only requests from the same PC. Pairing credentials are scoped to the local Ranker and can be revoked without changing the NovelAI key.
+
+When Local/Anima mode is enabled, the Ranker contacts only the local ComfyUI or Forge/Neo Forge endpoint you select (normally on `127.0.0.1` or your LAN). It does not upload local prompts, images, or rankings to the project maintainer. The local diffuser is your software and remains under your control.
 
 Because the interface is intentionally available to devices on your LAN, run it only on a network you trust and keep Windows Firewall set to private-network access. The dedicated phone workflow requires pairing, but local-network exposure is still a security boundary you control.
 

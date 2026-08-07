@@ -9,7 +9,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict, Mapping, Tuple
 
-PROFILE_SCHEMA_VERSION = 2
+PROFILE_SCHEMA_VERSION = 3
 
 OWNERSHIP_PROMPT = "prompt_only"
 OWNERSHIP_PROMPT_RESOLUTION = "prompt_resolution"
@@ -79,6 +79,16 @@ def clamp_int(value: Any, minimum: int, maximum: int, fallback: int) -> int:
     return max(minimum, min(maximum, result))
 
 
+def clamp_float(value: Any, minimum: float, maximum: float, fallback: float) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        result = float(fallback)
+    # Both NovelAI and the common local backends accept tenths for CFG. Keeping
+    # one decimal place also avoids Pydantic rejecting float artifacts.
+    return round(max(minimum, min(maximum, result)), 1)
+
+
 def normalize_ownership(value: Any) -> str:
     text = str(value or OWNERSHIP_PROMPT).strip().casefold()
     aliases = {
@@ -138,7 +148,9 @@ def normalize_scheduler(value: Any, sampler: Any) -> str:
     return text
 
 
-def default_generation_settings(*, width: int, height: int, steps: int, sampler: Any) -> Dict[str, Any]:
+def default_generation_settings(
+    *, width: int, height: int, steps: int, sampler: Any, cfg_scale: float = 6.0,
+) -> Dict[str, Any]:
     sampler_id = normalize_sampler(sampler)
     preset, width, height = resolve_resolution(
         infer_resolution_preset(width, height), width, height,
@@ -153,6 +165,7 @@ def default_generation_settings(*, width: int, height: int, steps: int, sampler:
         "width": width,
         "height": height,
         "steps": clamp_int(steps, 1, 50, 28),
+        "cfg_scale": clamp_float(cfg_scale, 0.0, 10.0, 6.0),
         "sampler": sampler_id,
         "scheduler": normalize_scheduler("default", sampler_id),
         "decrisp_mode": False,
@@ -186,6 +199,12 @@ def normalize_generation_settings(raw: Any, defaults: Mapping[str, Any]) -> Dict
         "width": width,
         "height": height,
         "steps": clamp_int(data.get("steps", defaults.get("steps", 28)), 1, 50, int(defaults.get("steps", 28))),
+        "cfg_scale": clamp_float(
+            data.get("cfg_scale", defaults.get("cfg_scale", 6.0)),
+            0.0,
+            10.0,
+            float(defaults.get("cfg_scale", 6.0)),
+        ),
         "sampler": sampler,
         "scheduler": scheduler,
         "decrisp_mode": bool(data.get("decrisp_mode", False)),
@@ -209,6 +228,7 @@ def normalize_profile(value: Any, defaults: Mapping[str, Any]) -> Tuple[Dict[str
         "width": settings["width"],
         "height": settings["height"],
         "steps": settings["steps"],
+        "cfg_scale": settings["cfg_scale"],
         "sampler": settings["sampler"],
         "scheduler": settings["scheduler"],
         "uc_preset": settings["uc_preset"],
@@ -242,7 +262,7 @@ def clean_profile_payload(data: Any, defaults: Mapping[str, Any]) -> Tuple[Dict[
 
 def build_profile(
     *, ownership: Any, positive: Any, negative: Any, resolution_preset: Any,
-    width: Any, height: Any, steps: Any, sampler: Any, scheduler: Any,
+    width: Any, height: Any, steps: Any, cfg_scale: Any, sampler: Any, scheduler: Any,
     uc_preset: Any, quality_toggle: Any, decrisp_mode: Any,
     variety_boost: Any, notes: Any, defaults: Mapping[str, Any],
 ) -> Dict[str, Any]:
@@ -255,6 +275,7 @@ def build_profile(
         "width": width,
         "height": height,
         "steps": steps,
+        "cfg_scale": cfg_scale,
         "sampler": sampler,
         "scheduler": scheduler,
         "uc_preset": uc_preset,
@@ -278,7 +299,7 @@ def apply_profile(profile: Mapping[str, Any], current: Mapping[str, Any], defaul
             resolved[key] = normalized[key]
     if ownership == OWNERSHIP_FULL:
         for key in (
-            "steps", "sampler", "scheduler", "uc_preset", "quality_toggle",
+            "steps", "cfg_scale", "sampler", "scheduler", "uc_preset", "quality_toggle",
             "decrisp_mode", "variety_boost",
         ):
             resolved[key] = normalized[key]
@@ -295,7 +316,7 @@ def profile_summary(name: str, profile: Mapping[str, Any], defaults: Mapping[str
         details = f"prompt + {dimensions}"
     else:
         sampler = SAMPLER_LABELS.get(normalized["sampler"], normalized["sampler"])
-        details = f"{dimensions}, {normalized['steps']} steps, {sampler}"
+        details = f"{dimensions}, {normalized['steps']} steps, CFG {normalized['cfg_scale']:g}, {sampler}"
     return f"{name} — {ownership} ({details})"
 
 
@@ -312,6 +333,7 @@ def snapshot_profile(name: str | None, profile: Mapping[str, Any] | None, resolv
         "width": settings["width"],
         "height": settings["height"],
         "steps": settings["steps"],
+        "cfg_scale": settings["cfg_scale"],
         "sampler": settings["sampler"],
         "scheduler": settings["scheduler"],
         "uc_preset": settings["uc_preset"],

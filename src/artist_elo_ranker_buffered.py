@@ -116,7 +116,7 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tu
 
 import gradio as gr
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 import uvicorn
 import numpy as np
 
@@ -257,6 +257,10 @@ from generation_profiles import (
 )
 
 from historical_media import COMPARISON_KIND, HistoricalMediaResolver
+from generation_mode_control import GenerationModeControl
+from generation_control_ui import GENERATION_CONTROL_HEAD, GENERATION_CONTROL_PANEL_HTML
+from dual_archive_transfer import DualArchiveTransferManager
+from local_generation_backend import LocalGenerationBackend
 
 
 # Policy/theme configuration is read from the actual imported config module.
@@ -608,8 +612,16 @@ BOOLEAN_PAGINATION_HEAD = r"""
 # or explicit environment override selects an alternate user-data root.
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROGRAM_DIR = SCRIPT_DIR
+GENERATION_MODE_CONTROL = GenerationModeControl(PROGRAM_DIR)
+GENERATION_MODE_CONTROL.ensure(os.environ.get("ARTIST_RANKER_GENERATION_MODE", "novelai"))
+GENERATION_MODE = GENERATION_MODE_CONTROL.active_mode
+if GENERATION_MODE == "novelai":
+    os.environ["ARTIST_RANKER_GENERATION_BACKEND"] = "novelai"
+LOCAL_GENERATION_BACKEND = LocalGenerationBackend(PROGRAM_DIR)
 
-_LEGACY_ARTIST_TAGS_FILE = Path(ARTIST_TAGS_FILE)
+_LEGACY_ARTIST_TAGS_FILE = Path(
+    str(os.environ.get("ARTIST_RANKER_ARTIST_TAGS_FILE", "") or ARTIST_TAGS_FILE)
+)
 _LEGACY_ELO_RATINGS_FILE = Path(ELO_RATINGS_FILE)
 _LEGACY_COMPARISON_HISTORY_FILE = Path(COMPARISON_HISTORY_FILE)
 _LEGACY_ACTIVE_POOL_FILE = Path(ACTIVE_POOL_FILE)
@@ -668,11 +680,15 @@ ARTIST_PORTRAITS_FILE = DATA_LAYOUT.path("artist_portraits_file")
 ARTIST_PORTRAITS_DIR = DATA_LAYOUT.path("artist_portraits_dir")
 TOP50_ENTRY_FILE = DATA_LAYOUT.path("top50_entry_file")
 FAVORITE_DUEL_ARCHIVE_DIR = DATA_LAYOUT.path("favorite_duel_archive_dir")
+GENERATION_PREVIEW_DIR = DATA_ROOT / "media" / "generation_previews"
 HISTORICAL_MEDIA_RESOLVER = HistoricalMediaResolver(
     COMPARISON_IMAGES_DIR,
     FAVORITE_DUEL_ARCHIVE_DIR,
 )
 TOP50_RECENT_BADGE_DUELS = 100
+PORTRAIT_RECENT_DUEL_LIMIT = 20
+MAX_LIVE_PREVIEW_DUELS = 10
+GENERATION_PREVIEW_FINAL_HOLD_SECONDS = 3.0
 
 # Bind to all local interfaces so another device on the same Wi-Fi/LAN can open
 # the Gradio page. Set ARTIST_ELO_SERVER_HOST to override this deliberately.
@@ -692,6 +708,7 @@ DEFAULT_GENERATION_PROFILE_SETTINGS = default_generation_settings(
     height=IMG_HEIGHT,
     steps=STEPS,
     sampler=DEFAULT_SAMPLER_ID,
+    cfg_scale=LOCAL_GENERATION_BACKEND.configured_cfg_scale,
 )
 
 
@@ -727,11 +744,12 @@ def _generation_config_summary(config: Any) -> str:
     width = int(config.get("width", IMG_WIDTH) or IMG_WIDTH)
     height = int(config.get("height", IMG_HEIGHT) or IMG_HEIGHT)
     steps = int(config.get("steps", STEPS) or STEPS)
+    cfg_scale = float(config.get("cfg_scale", DEFAULT_GENERATION_PROFILE_SETTINGS["cfg_scale"]))
     sampler_id = str(config.get("sampler", DEFAULT_SAMPLER_ID) or DEFAULT_SAMPLER_ID)
     scheduler_id = str(config.get("scheduler", "default") or "default")
     sampler_label = SAMPLER_LABELS.get(sampler_id, sampler_id)
     scheduler_label = SCHEDULER_LABELS.get(scheduler_id, scheduler_id)
-    return f"{name} · {width}×{height} · {steps} steps · {sampler_label} · {scheduler_label}"
+    return f"{name} · {width}×{height} · {steps} steps · CFG {cfg_scale:g} · {sampler_label} · {scheduler_label}"
 
 
 SECURE_SETUP_CSS = r"""
@@ -1345,7 +1363,7 @@ RECENT_ARTIST_MEMORY = 1600
 # SHAREABLE_EDITION_SECURE_CONFIGURATION_V190
 # API credentials are never embedded or read from config.py. They live only in
 # Windows Credential Manager and are fetched only when a NovelAI session is needed.
-SHAREABLE_EDITION_VERSION = "2.6.2"
+SHAREABLE_EDITION_VERSION = "2.6.3"
 GITHUB_REPOSITORY = "SeaBassBand/NovelAI-Artist-Ranker"
 # SHAREABLE_EDITION_GENERATION_PROFILES_V202
 # SHAREABLE_EDITION_STORAGE_RETENTION_V211
@@ -4795,6 +4813,7 @@ def load_storage_settings() -> dict:
         "orphan_min_age_days": 2,
         "matchmaking_mode": MATCHMAKING_MODE_COVERAGE,
         "record_generation_timing": False,
+        "live_preview_duels": 0,
         "update_channel": "stable",
         "update_auto_check_enabled": False,
         "update_auto_check_interval_hours": 24,
@@ -7698,8 +7717,8 @@ class ArtistTagManager:
         return {"size": 0, "total_artists": len(self.artists)}
 
     def format_artist_tags(self, artists: List[str]) -> str:
-        """Format artist list as comma-separated artist tags."""
-        return ", ".join(f"artist: {artist}" for artist in artists)
+        """Format artist tags for the selected generation backend."""
+        return LOCAL_GENERATION_BACKEND.format_artist_tags(artists)
 
 
 # --------------------------------------------------------------------------------
@@ -7959,7 +7978,7 @@ def remove_nsfw_from_generated_request(gen: GenerateImageInfer) -> None:
 
 
 async def generate_image(
-    session: ApiCredential,
+    session: Optional[ApiCredential],
     prompt: str,
     output_path: Path,
     negative_prompt: str = None,
@@ -7967,10 +7986,12 @@ async def generate_image(
     uc_preset: int = 0,
     seed: Optional[int] = None,
     timing_callback: Any = None,
+    preview_callback: Any = None,
     *,
     width: int = IMG_WIDTH,
     height: int = IMG_HEIGHT,
     steps: int = STEPS,
+    cfg_scale: float = 6.0,
     sampler: Any = DEFAULT_SAMPLER_ID,
     scheduler: str = "default",
     decrisp_mode: bool = False,
@@ -7981,6 +8002,25 @@ async def generate_image(
     timing_started_perf = time.perf_counter()
     timing_success = False
     try:
+        if LOCAL_GENERATION_BACKEND.is_local:
+            await asyncio.to_thread(
+                LOCAL_GENERATION_BACKEND.generate,
+                prompt=prompt,
+                output_path=output_path,
+                negative_prompt=NEGATIVE_PROMPT if negative_prompt is None else negative_prompt,
+                seed=seed,
+                width=int(width),
+                height=int(height),
+                steps=int(steps),
+                cfg_scale=float(cfg_scale),
+                sampler=str(sampler),
+                scheduler=str(scheduler),
+                preview_callback=preview_callback,
+            )
+            note_successful_image_and_maybe_cleanup()
+            timing_success = True
+            return True
+
         # Map UC preset index to enum (-1 = None/disabled)
         uc_preset_map = {
             -1: None,  # Disabled
@@ -8010,6 +8050,8 @@ async def generate_image(
             # build_generate does not expose noise_schedule, but the SDK parameter
             # model does. Set the already-validated Phase 3 scheduler explicitly.
             gen.parameters.noise_schedule = runtime_scheduler
+        if getattr(gen, "parameters", None) is not None:
+            gen.parameters.scale = round(max(0.0, min(10.0, float(cfg_scale))), 1)
 
         # The SDK expands the selected UC preset while constructing the request.
         # Sanitize afterward so standalone NSFW is absent from both serialized fields.
@@ -8510,7 +8552,9 @@ class ArtistELORanker:
             self.matchmaking_state,
         )
         self.session: Optional[ApiCredential] = None
-        self.api_key_configured: bool = novelai_key_is_configured()
+        self.api_key_configured: bool = (
+            LOCAL_GENERATION_BACKEND.is_local or novelai_key_is_configured()
+        )
 
         # Phase 3 generation profiles. Existing saved prompts are migrated in-place
         # as Prompt-only profiles without changing their positive/negative text.
@@ -8550,6 +8594,14 @@ class ArtistELORanker:
             backup_root=Path(backup_destination) if backup_destination else None,
             github_repository=GITHUB_REPOSITORY,
         )
+        if os.environ.get("ARTIST_RANKER_MODE_CONTROL", "").strip():
+            self.transfer_recovery = DualArchiveTransferManager(
+                self.transfer_recovery,
+                DATA_LAYOUT,
+                PROGRAM_DIR,
+                SHAREABLE_EDITION_VERSION,
+                GENERATION_MODE_CONTROL.path,
+            )
         self.storage_settings["backup_destination"] = str(self.transfer_recovery.backup_root)
         save_storage_settings(self.storage_settings)
         self.generation_timing_stats = GenerationTimingStats(GENERATION_TIMING_STATS_FILE)
@@ -8578,6 +8630,15 @@ class ArtistELORanker:
         self.generation_paused: bool = bool(self.legacy_competitive_guard)
         self.buffer_generation_token: int = 0
         self.last_generation_error: str = ""
+        self.preview_lock = threading.RLock()
+        self.generation_previews: Dict[int, Dict[str, Any]] = {}
+        GENERATION_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            preview_count = int(self.storage_settings.get("live_preview_duels", 0) or 0)
+        except (TypeError, ValueError):
+            preview_count = 0
+        self.storage_settings["live_preview_duels"] = max(0, min(MAX_LIVE_PREVIEW_DUELS, preview_count))
+        save_storage_settings(self.storage_settings)
 
         # Current generation settings for future buffer refills
         self.generation_settings = normalize_generation_settings(
@@ -9753,6 +9814,7 @@ class ArtistELORanker:
         width: int = IMG_WIDTH,
         height: int = IMG_HEIGHT,
         steps: int = STEPS,
+        cfg_scale: float = 6.0,
         sampler: str = DEFAULT_SAMPLER_ID,
         scheduler: str = "default",
         uc_preset: int = 0,
@@ -9775,6 +9837,7 @@ class ArtistELORanker:
             width=width,
             height=height,
             steps=steps,
+            cfg_scale=cfg_scale,
             sampler=sampler,
             scheduler=scheduler,
             uc_preset=uc_preset,
@@ -9848,6 +9911,7 @@ class ArtistELORanker:
             "width": resolved["width"],
             "height": resolved["height"],
             "steps": resolved["steps"],
+            "cfg_scale": resolved["cfg_scale"],
             "sampler": resolved["sampler"],
             "scheduler": resolved["scheduler"],
             "uc_preset": resolved["uc_preset"],
@@ -9905,6 +9969,7 @@ class ArtistELORanker:
         width: int = IMG_WIDTH,
         height: int = IMG_HEIGHT,
         steps: int = STEPS,
+        cfg_scale: float = 6.0,
         sampler: str = DEFAULT_SAMPLER_ID,
         scheduler: str = "default",
         decrisp_mode: bool = False,
@@ -9933,6 +9998,7 @@ class ArtistELORanker:
                 "width": width,
                 "height": height,
                 "steps": steps,
+                "cfg_scale": cfg_scale,
                 "sampler": sampler,
                 "scheduler": scheduler,
                 "decrisp_mode": decrisp_mode,
@@ -10087,7 +10153,7 @@ class ArtistELORanker:
 
     def start_refill_if_needed(self):
         """Start sequential background refill if the rolling buffer is below target."""
-        if not self.api_key_configured:
+        if not LOCAL_GENERATION_BACKEND.is_local and not self.api_key_configured:
             self.last_generation_error = (
                 "NovelAI API key not configured. Open Maintenance locally to continue."
             )
@@ -10153,7 +10219,140 @@ class ArtistELORanker:
             reason, details, matchmaking_score,
         )
 
-    async def _generate_comparison_item_async(self, session: ApiCredential, settings: dict) -> Optional[ComparisonItem]:
+    def set_live_preview_duels(self, value: Any) -> int:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            normalized = 0
+        normalized = max(0, min(MAX_LIVE_PREVIEW_DUELS, normalized))
+        with self.state_lock:
+            self.storage_settings["live_preview_duels"] = normalized
+            save_storage_settings(self.storage_settings)
+        if normalized == 0:
+            with self.preview_lock:
+                self.generation_previews.clear()
+        return normalized
+
+    def _live_preview_limit(self) -> int:
+        with self.state_lock:
+            try:
+                value = int(self.storage_settings.get("live_preview_duels", 0) or 0)
+            except (TypeError, ValueError):
+                value = 0
+        return max(0, min(MAX_LIVE_PREVIEW_DUELS, value))
+
+    def _begin_generation_preview(self, slot: int, artists_a: List[str], artists_b: List[str]) -> None:
+        with self.preview_lock:
+            # A new refill pass owns a stable slot. Discard an older preview for
+            # that slot while retaining other visible first-X generations.
+            self.generation_previews[int(slot)] = {
+                "slot": int(slot), "started_at": time.time(), "updated_at": time.time(),
+                "artists_a": list(artists_a), "artists_b": list(artists_b),
+                "sides": {
+                    "A": {"version": 0, "progress": 0.0, "complete": False, "success": None, "has_image": False},
+                    "B": {"version": 0, "progress": 0.0, "complete": False, "success": None, "has_image": False},
+                },
+            }
+
+    def _generation_preview_callback(self, slot: int, side: str):
+        normalized_side = "A" if str(side).upper() == "A" else "B"
+        path = GENERATION_PREVIEW_DIR / f"slot_{int(slot):02d}_{normalized_side.lower()}.image"
+
+        def callback(image_bytes: bytes, metadata: Dict[str, Any]) -> None:
+            with self.preview_lock:
+                entry = self.generation_previews.get(int(slot))
+                if entry is None:
+                    return
+                side_state = entry["sides"][normalized_side]
+                if image_bytes:
+                    temporary = path.with_suffix(path.suffix + ".part")
+                    temporary.write_bytes(image_bytes)
+                    os.replace(temporary, path)
+                    side_state["has_image"] = True
+                    side_state["version"] = int(side_state.get("version", 0)) + 1
+                try:
+                    side_state["progress"] = max(0.0, min(1.0, float(metadata.get("progress", side_state.get("progress", 0.0)) or 0.0)))
+                except (TypeError, ValueError):
+                    pass
+                side_state["kind"] = str(metadata.get("kind", "preview") or "preview")
+                side_state["backend"] = str(metadata.get("backend", LOCAL_GENERATION_BACKEND.backend) or LOCAL_GENERATION_BACKEND.backend)
+                entry["updated_at"] = time.time()
+        return callback
+
+    def _finish_generation_preview_side(self, slot: int, side: str, final_path: Path, success: bool) -> None:
+        normalized_side = "A" if str(side).upper() == "A" else "B"
+        callback = self._generation_preview_callback(slot, normalized_side)
+        if success and Path(final_path).is_file():
+            try:
+                callback(Path(final_path).read_bytes(), {"kind": "final", "progress": 1.0, "backend": LOCAL_GENERATION_BACKEND.backend})
+            except OSError:
+                pass
+        with self.preview_lock:
+            entry = self.generation_previews.get(int(slot))
+            if entry is not None:
+                # Complete means the backend stopped working on this side;
+                # success records whether it produced a usable final image.
+                # Keeping those concepts separate lets failed previews retire
+                # instead of remaining in the duel area forever.
+                entry["sides"][normalized_side]["complete"] = True
+                entry["sides"][normalized_side]["success"] = bool(success)
+                entry["updated_at"] = time.time()
+
+    def generation_preview_payload(self) -> dict:
+        limit = self._live_preview_limit()
+        with self.preview_lock:
+            now = time.time()
+            expired_slots = [
+                slot
+                for slot, entry in self.generation_previews.items()
+                if all(
+                    bool(side_state.get("complete"))
+                    for side_state in entry.get("sides", {}).values()
+                )
+                and now - float(entry.get("updated_at", now) or now)
+                >= GENERATION_PREVIEW_FINAL_HOLD_SECONDS
+            ]
+            for slot in expired_slots:
+                self.generation_previews.pop(slot, None)
+                for side in ("a", "b"):
+                    try:
+                        (GENERATION_PREVIEW_DIR / f"slot_{int(slot):02d}_{side}.image").unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            items = []
+            for slot in sorted(self.generation_previews):
+                if slot > limit:
+                    continue
+                entry = deepcopy(self.generation_previews[slot])
+                for side, side_state in entry.get("sides", {}).items():
+                    side_state["image_url"] = (
+                        f"/api/generation-control/preview/{slot}/{side}?v={int(side_state.get('version', 0))}"
+                        if side_state.get("has_image") else ""
+                    )
+                items.append(entry)
+        return {
+            "enabled": bool(LOCAL_GENERATION_BACKEND.is_local and limit > 0),
+            "supported": bool(LOCAL_GENERATION_BACKEND.is_local),
+            "backend": LOCAL_GENERATION_BACKEND.backend,
+            "limit": limit,
+            "maximum": MAX_LIVE_PREVIEW_DUELS,
+            "items": items,
+            "novelai_note": (
+                "The current NovelAI image API returns only the completed image archive; its private website previews are not exposed to this client."
+                if not LOCAL_GENERATION_BACKEND.is_local else ""
+            ),
+        }
+
+    def generation_preview_path(self, slot: int, side: str) -> Optional[Path]:
+        normalized_side = "A" if str(side).upper() == "A" else "B"
+        path = (GENERATION_PREVIEW_DIR / f"slot_{int(slot):02d}_{normalized_side.lower()}.image").resolve()
+        try:
+            path.relative_to(GENERATION_PREVIEW_DIR.resolve())
+        except ValueError:
+            return None
+        return path if path.is_file() else None
+
+    async def _generate_comparison_item_async(self, session: Optional[ApiCredential], settings: dict, buffer_slot: int = 0) -> Optional[ComparisonItem]:
         """Generate a single duel sequentially (A then B), with reliable timing capture."""
         settings = self._resolve_rotation_for_duel(settings)
         base_prompt = settings["base_prompt"]
@@ -10165,6 +10364,7 @@ class ArtistELORanker:
         width = int(settings.get("width", IMG_WIDTH))
         height = int(settings.get("height", IMG_HEIGHT))
         steps = int(settings.get("steps", STEPS))
+        cfg_scale = float(settings.get("cfg_scale", DEFAULT_GENERATION_PROFILE_SETTINGS["cfg_scale"]))
         sampler = str(settings.get("sampler", DEFAULT_SAMPLER_ID))
         scheduler = str(settings.get("scheduler", "default"))
         decrisp_mode = bool(settings.get("decrisp_mode", False))
@@ -10174,6 +10374,14 @@ class ArtistELORanker:
             artists_a, artists_b, prompt_a, prompt_b, path_a, path_b, seed,
             matchmaking_reason, matchmaking_details, matchmaking_score,
         ) = self._prepare_comparison_pair(base_prompt)
+
+        preview_enabled = bool(
+            LOCAL_GENERATION_BACKEND.is_local
+            and int(buffer_slot or 0) > 0
+            and int(buffer_slot) <= self._live_preview_limit()
+        )
+        if preview_enabled:
+            self._begin_generation_preview(int(buffer_slot), artists_a, artists_b)
 
         with self.state_lock:
             record_generation_timing = bool(
@@ -10195,9 +10403,13 @@ class ArtistELORanker:
                 session, prompt_a, path_a, negative_prompt, quality_toggle, uc_preset, seed,
                 timing_callback=capture_image_timing if record_generation_timing else None,
                 width=width, height=height, steps=steps, sampler=sampler,
+                cfg_scale=cfg_scale,
                 scheduler=scheduler, decrisp_mode=decrisp_mode,
                 variety_boost=variety_boost,
+                preview_callback=self._generation_preview_callback(buffer_slot, "A") if preview_enabled else None,
             )
+            if preview_enabled:
+                self._finish_generation_preview_side(buffer_slot, "A", path_a, success_a)
 
             print(f"Generating image B with artists: {artists_b} | seed: {seed}")
             print(f"Prompt B: {prompt_b[:200]}...")
@@ -10205,9 +10417,13 @@ class ArtistELORanker:
                 session, prompt_b, path_b, negative_prompt, quality_toggle, uc_preset, seed,
                 timing_callback=capture_image_timing if record_generation_timing else None,
                 width=width, height=height, steps=steps, sampler=sampler,
+                cfg_scale=cfg_scale,
                 scheduler=scheduler, decrisp_mode=decrisp_mode,
                 variety_boost=variety_boost,
+                preview_callback=self._generation_preview_callback(buffer_slot, "B") if preview_enabled else None,
             )
+            if preview_enabled:
+                self._finish_generation_preview_side(buffer_slot, "B", path_b, success_b)
 
             if success_a and success_b:
                 with self.state_lock:
@@ -10261,13 +10477,16 @@ class ArtistELORanker:
         asyncio.set_event_loop(loop)
         had_error = False
         try:
-            try:
-                session = self.get_session()
-            except Exception as e:
-                with self.state_lock:
-                    if token == self.buffer_generation_token:
-                        self.last_generation_error = str(e)
-                return
+            if LOCAL_GENERATION_BACKEND.is_local:
+                session = None
+            else:
+                try:
+                    session = self.get_session()
+                except Exception as e:
+                    with self.state_lock:
+                        if token == self.buffer_generation_token:
+                            self.last_generation_error = str(e)
+                    return
 
             while True:
                 with self.state_lock:
@@ -10281,8 +10500,9 @@ class ArtistELORanker:
                     if total_ready >= self.target_buffer_size:
                         break
                     settings = dict(self.generation_settings)
+                    buffer_slot = total_ready + 1
 
-                item = loop.run_until_complete(self._generate_comparison_item_async(session, settings))
+                item = loop.run_until_complete(self._generate_comparison_item_async(session, settings, buffer_slot))
                 if item is None:
                     had_error = True
                     with self.state_lock:
@@ -10369,6 +10589,7 @@ class ArtistELORanker:
         width: int = IMG_WIDTH,
         height: int = IMG_HEIGHT,
         steps: int = STEPS,
+        cfg_scale: float = 6.0,
         sampler: str = DEFAULT_SAMPLER_ID,
         scheduler: str = "default",
         decrisp_mode: bool = False,
@@ -10387,6 +10608,7 @@ class ArtistELORanker:
             width,
             height,
             steps,
+            cfg_scale,
             sampler,
             scheduler,
             decrisp_mode,
@@ -13637,7 +13859,7 @@ class ArtistELORanker:
         return json.dumps(response)
 
     def handle_portrait_request(self, payload_text: str) -> str:
-        """Return recent solo Gallery images that can represent one artist."""
+        """Return images from the newest available duels containing one artist."""
         try:
             payload = json.loads(str(payload_text or "{}"))
         except Exception:
@@ -13658,38 +13880,53 @@ class ArtistELORanker:
 
         candidates: List[dict] = []
         seen_paths: Set[str] = set()
+        candidate_duels = 0
+        artist_folded = artist.casefold()
         for history_number in range(len(self.history.records), 0, -1):
             record = self.history.records[history_number - 1]
+            duel_had_candidate = False
             for side in ("A", "B"):
                 artists = [str(value) for value in record.get(f"artists_{side.lower()}", [])]
-                if len(artists) != 1 or artists[0].casefold() != artist.casefold():
+                if artist_folded not in {value.casefold() for value in artists}:
                     continue
-                path = str(record.get(f"image_{side.lower()}_path", "") or "")
-                if not path or path in seen_paths or not Path(path).exists():
+                stored_path = str(record.get(f"image_{side.lower()}_path", "") or "")
+                resolution = HISTORICAL_MEDIA_RESOLVER.resolve(
+                    stored_path,
+                    record=record,
+                    side=side,
+                )
+                if not resolution.available:
+                    continue
+                path = str(resolution.resolved_path)
+                path_identity = os.path.normcase(os.path.abspath(path))
+                if path_identity in seen_paths:
                     continue
                 preview = self._portrait_preview_data_url(path)
                 if not preview:
                     continue
-                seen_paths.add(path)
+                seen_paths.add(path_identity)
+                duel_had_candidate = True
                 candidates.append({
                     "source_path": path,
                     "preview": preview,
                     "history_number": history_number,
                     "side": side,
                     "winner": str(record.get("winner", "") or ""),
+                    "team_size": len(artists),
                     "date": time.strftime(
                         "%Y-%m-%d",
                         time.localtime(float(record.get("timestamp", 0.0) or 0.0)),
                     ) if record.get("timestamp") else "Unknown",
                 })
-                if len(candidates) >= 18:
-                    break
-            if len(candidates) >= 18:
+            if duel_had_candidate:
+                candidate_duels += 1
+            if candidate_duels >= PORTRAIT_RECENT_DUEL_LIMIT:
                 break
         response["ok"] = True
         response["candidates"] = candidates
+        response["duel_limit"] = PORTRAIT_RECENT_DUEL_LIMIT
         if not candidates:
-            response["error"] = "No available solo Gallery images were found for this artist."
+            response["error"] = "No available Gallery images were found for this artist."
         return json.dumps(response)
 
     def handle_portrait_save(self, payload_text: str) -> str:
@@ -14864,11 +15101,18 @@ class ArtistELORanker:
         lan_urls = discover_lan_urls(SERVER_PORT)
         lan_text = lan_urls[0] if lan_urls else "Use this PC's local IPv4 address"
         check = lambda value: "✅" if value else "⚠️"
-        self.api_key_configured = novelai_key_is_configured()
+        self.api_key_configured = (
+            LOCAL_GENERATION_BACKEND.is_local or novelai_key_is_configured()
+        )
+        backend_detail = (
+            f"Local {LOCAL_GENERATION_BACKEND.display_name} (Anima syntax)"
+            if LOCAL_GENERATION_BACKEND.is_local
+            else "NovelAI"
+        )
         return (
             f"### Setup checklist\n"
             f"**Setup state:** `{'Complete' if complete else 'Needs attention'}`  \n"
-            f"{check(self.api_key_configured)} API key: `{'Configured' if self.api_key_configured else 'Not configured'}`  \n"
+            f"{check(self.api_key_configured)} Generation backend: `{backend_detail}`  \n"
             f"{check(artist_count > 0)} Artist list: `{artist_count:,} artists`  \n"
             f"{check(disk_ok)} Free space at data location: `{free_text}`  \n"
             f"✅ Program folder: `{PROGRAM_DIR}`  \n"
@@ -14887,7 +15131,9 @@ class ArtistELORanker:
         )
 
     def complete_first_run_setup(self, retention_policy: str) -> Tuple[str, str, Optional[str]]:
-        self.api_key_configured = novelai_key_is_configured()
+        self.api_key_configured = (
+            LOCAL_GENERATION_BACKEND.is_local or novelai_key_is_configured()
+        )
         if not self.api_key_configured:
             return self.first_run_setup_markdown(), "Configure the NovelAI API key first.", None
         if not self.artist_manager.artists:
@@ -14925,6 +15171,9 @@ class ArtistELORanker:
         initial_width = int(self.generation_settings.get("width", IMG_WIDTH))
         initial_height = int(self.generation_settings.get("height", IMG_HEIGHT))
         initial_steps = int(self.generation_settings.get("steps", STEPS))
+        initial_cfg_scale = float(
+            self.generation_settings.get("cfg_scale", DEFAULT_GENERATION_PROFILE_SETTINGS["cfg_scale"])
+        )
         initial_sampler = str(self.generation_settings.get("sampler", DEFAULT_SAMPLER_ID))
         initial_scheduler = str(self.generation_settings.get("scheduler", "default"))
         initial_decrisp_mode = bool(self.generation_settings.get("decrisp_mode", False))
@@ -15036,6 +15285,14 @@ class ArtistELORanker:
                     )
 
                     with gr.Row(elem_id="compare-toolbar"):
+                        generation_settings_shortcut_btn = gr.Button(
+                            "Generation settings",
+                            variant="secondary",
+                            size="sm",
+                            scale=0,
+                            min_width=152,
+                            elem_id="generation-settings-shortcut",
+                        )
                         sound_settings_btn = gr.Button(
                             "🔊 Sounds",
                             variant="secondary",
@@ -15192,7 +15449,7 @@ class ArtistELORanker:
                                     ):
                                         gr.HTML(
                                             '<div class="profile-setting-card-heading">'
-                                            '<div><strong>Complete generation configuration</strong><span>Sampling and NovelAI quality behavior.</span></div>'
+                                            '<div><strong>Complete generation configuration</strong><span>Sampling, guidance, and engine quality behavior.</span></div>'
                                             '<span class="profile-save-rule complete">Saved only by Complete configuration</span>'
                                             '</div>'
                                         )
@@ -15203,6 +15460,14 @@ class ArtistELORanker:
                                                 maximum=50,
                                                 step=1,
                                                 value=initial_steps,
+                                            )
+                                            cfg_scale_input = gr.Slider(
+                                                label="CFG / guidance scale",
+                                                minimum=0,
+                                                maximum=10,
+                                                step=0.1,
+                                                value=initial_cfg_scale,
+                                                info="Higher values follow the prompt more strongly. Anima workflows commonly use values near 1.",
                                             )
                                             sampler_dropdown = gr.Dropdown(
                                                 label="Sampler",
@@ -15976,6 +16241,13 @@ class ArtistELORanker:
                         "Low-frequency behavior and display preferences have moved to the main **Settings** panel. "
                         "The floating Help button can be restored either here or in Settings."
                     )
+                    # The generation controls are server-rendered in Maintenance
+                    # so Gradio owns their stable mount point. Their companion
+                    # script puts only live frames in the normal duel cards.
+                    gr.HTML(
+                        GENERATION_CONTROL_PANEL_HTML,
+                        elem_id="generation-control-server-host",
+                    )
                     version_status = gr.Markdown(self.version_status_markdown(), elem_id="phase9-version-status")
                     help_button_visible_setting = gr.Checkbox(
                         label="Show floating Help button on this device [?]",
@@ -16686,6 +16958,7 @@ class ArtistELORanker:
                 width_input,
                 height_input,
                 steps_input,
+                cfg_scale_input,
                 sampler_dropdown,
                 scheduler_dropdown,
                 decrisp_toggle,
@@ -16811,13 +17084,13 @@ class ArtistELORanker:
             def update_settings_from_inputs(
                 prompt, negative_prompt, quality_tags, uc_preset,
                 buffer_size, rotation_on, rotation_names,
-                resolution_preset, width, height, steps, sampler, scheduler,
+                resolution_preset, width, height, steps, cfg_scale, sampler, scheduler,
                 decrisp_mode, variety_boost,
             ):
                 self.update_generation_settings(
                     prompt, negative_prompt, quality_tags, uc_preset,
                     buffer_size, rotation_on, rotation_names,
-                    resolution_preset, width, height, steps, sampler, scheduler,
+                    resolution_preset, width, height, steps, cfg_scale, sampler, scheduler,
                     decrisp_mode, variety_boost,
                 )
 
@@ -16988,7 +17261,7 @@ class ArtistELORanker:
                 return self.save_compare_manual_style_tags(target_label, artist_name, selected_labels)
 
             def _current_generation_editor_settings(
-                resolution_preset, width, height, steps, sampler, scheduler,
+                resolution_preset, width, height, steps, cfg_scale, sampler, scheduler,
                 uc_preset, quality_toggle, decrisp_mode, variety_boost,
             ):
                 return {
@@ -16996,6 +17269,7 @@ class ArtistELORanker:
                     "width": width,
                     "height": height,
                     "steps": steps,
+                    "cfg_scale": cfg_scale,
                     "sampler": sampler,
                     "scheduler": scheduler,
                     "uc_preset": uc_preset,
@@ -17006,14 +17280,14 @@ class ArtistELORanker:
 
             def on_load_saved_prompt(
                 profile_name, positive_prompt, negative_prompt,
-                resolution_preset, width, height, steps, sampler, scheduler,
+                resolution_preset, width, height, steps, cfg_scale, sampler, scheduler,
                 uc_preset, quality_toggle, decrisp_mode, variety_boost,
                 buffer_size, rotation_on, rotation_names,
             ):
                 if not profile_name:
                     return (
                         positive_prompt, negative_prompt, "", OWNERSHIP_PROMPT, "",
-                        resolution_preset, width, height, steps, sampler, scheduler,
+                        resolution_preset, width, height, steps, cfg_scale, sampler, scheduler,
                         uc_preset, quality_toggle, decrisp_mode, variety_boost, "",
                     )
                 result = self.load_saved_prompt(
@@ -17021,14 +17295,14 @@ class ArtistELORanker:
                     positive_prompt,
                     negative_prompt,
                     _current_generation_editor_settings(
-                        resolution_preset, width, height, steps, sampler, scheduler,
+                        resolution_preset, width, height, steps, cfg_scale, sampler, scheduler,
                         uc_preset, quality_toggle, decrisp_mode, variety_boost,
                     ),
                 )
                 if not result.get("ok"):
                     return (
                         positive_prompt, negative_prompt, "", OWNERSHIP_PROMPT, "",
-                        resolution_preset, width, height, steps, sampler, scheduler,
+                        resolution_preset, width, height, steps, cfg_scale, sampler, scheduler,
                         uc_preset, quality_toggle, decrisp_mode, variety_boost,
                         result.get("message", "**Generation profile not found.**"),
                     )
@@ -17037,7 +17311,7 @@ class ArtistELORanker:
                     result["quality_toggle"], result["uc_preset"],
                     buffer_size, rotation_on, rotation_names,
                     result["resolution_preset"], result["width"], result["height"],
-                    result["steps"], result["sampler"], result["scheduler"],
+                    result["steps"], result["cfg_scale"], result["sampler"], result["scheduler"],
                     result["decrisp_mode"], result["variety_boost"],
                 )
                 self.start_refill_if_needed()
@@ -17045,7 +17319,7 @@ class ArtistELORanker:
                     result["positive"], result["negative"], result["name"],
                     result["ownership"], result["notes"],
                     result["resolution_preset"], result["width"], result["height"],
-                    result["steps"], result["sampler"], result["scheduler"],
+                    result["steps"], result["cfg_scale"], result["sampler"], result["scheduler"],
                     result["uc_preset"], result["quality_toggle"],
                     result["decrisp_mode"], result["variety_boost"],
                     result["message"],
@@ -17056,13 +17330,13 @@ class ArtistELORanker:
 
             def on_save_preset(
                 name, positive, negative, ownership, notes,
-                resolution_preset, width, height, steps, sampler, scheduler,
+                resolution_preset, width, height, steps, cfg_scale, sampler, scheduler,
                 uc_preset, quality_toggle, decrisp_mode, variety_boost,
                 current_rotation, current_gallery_preset,
             ):
                 message = self.save_prompt_preset(
                     name, positive, negative, ownership,
-                    resolution_preset, width, height, steps, sampler, scheduler,
+                    resolution_preset, width, height, steps, cfg_scale, sampler, scheduler,
                     uc_preset, quality_toggle, decrisp_mode, variety_boost, notes,
                 )
                 names = self.get_saved_prompt_names()
@@ -18359,6 +18633,7 @@ class ArtistELORanker:
                 inputs=[
                     saved_preset_selector, prompt_input, negative_prompt_input,
                     resolution_preset_dropdown, width_input, height_input, steps_input,
+                    cfg_scale_input,
                     sampler_dropdown, scheduler_dropdown, uc_preset_dropdown,
                     quality_toggle, decrisp_toggle, variety_boost_toggle,
                     buffer_size_slider, rotation_enabled, rotation_presets,
@@ -18367,6 +18642,7 @@ class ArtistELORanker:
                     prompt_input, negative_prompt_input, preset_name_input,
                     profile_ownership_dropdown, profile_notes_input,
                     resolution_preset_dropdown, width_input, height_input, steps_input,
+                    cfg_scale_input,
                     sampler_dropdown, scheduler_dropdown, uc_preset_dropdown,
                     quality_toggle, decrisp_toggle, variety_boost_toggle, preset_status,
                 ],
@@ -18391,6 +18667,7 @@ class ArtistELORanker:
                     preset_name_input, prompt_input, negative_prompt_input,
                     profile_ownership_dropdown, profile_notes_input,
                     resolution_preset_dropdown, width_input, height_input, steps_input,
+                    cfg_scale_input,
                     sampler_dropdown, scheduler_dropdown, uc_preset_dropdown,
                     quality_toggle, decrisp_toggle, variety_boost_toggle,
                     rotation_presets, gallery_preset_filter,
@@ -18419,6 +18696,7 @@ class ArtistELORanker:
             for control in (
                 buffer_size_slider, rotation_enabled, rotation_presets,
                 resolution_preset_dropdown, width_input, height_input, steps_input,
+                cfg_scale_input,
                 sampler_dropdown, scheduler_dropdown, decrisp_toggle, variety_boost_toggle,
                 quality_toggle, uc_preset_dropdown,
             ):
@@ -19263,6 +19541,10 @@ CONTEXT_UI_JS = r"""
         }
     };
     const copyArtistName = (artist) => copyTextToClipboard(`1::artist:${artist} ::,`);
+    const copyArtistAnima = (artist) => {
+        const normalized = String(artist || '').trim().replace(/^@+/, '').replace(/_/g, ' ').replace(/\s+/g, ' ').toLowerCase();
+        return copyTextToClipboard(normalized ? `@${normalized}` : '');
+    };
     const copyArtistRaw = (artist) => copyTextToClipboard(String(artist || ''));
     const copyArtistBooru = (artist) => copyTextToClipboard(String(artist || '').trim().replace(/\s+/g, '_'));
     const openArtistSearch = (site, artist) => {
@@ -19970,6 +20252,7 @@ CONTEXT_UI_JS = r"""
         submenu.className = 'context-search-menu';
         const options = [
             ['NovelAI syntax', () => copyArtistName(artist)],
+            ['Anima syntax', () => copyArtistAnima(artist)],
             ['Raw artist name', () => copyArtistRaw(artist)],
             ['Booru tag', () => copyArtistBooru(artist)],
         ];
@@ -20972,7 +21255,7 @@ POLISH_UI_JS = r"""
         } catch (_) {}
         await sleep(50);
       }
-      throw new Error('Timed out loading solo Gallery images.');
+      throw new Error('Timed out loading recent Gallery images.');
     };
     const closePortrait = () => {
       portraitModal?.classList.remove('is-open');
@@ -20987,7 +21270,7 @@ POLISH_UI_JS = r"""
         <div class="portrait-card" role="dialog" aria-modal="true">
           <div class="portrait-header"><div><div class="portrait-title">Artist portrait</div><div class="portrait-subtitle" style="font-size:.75rem;opacity:.68"></div></div><button class="portrait-close" type="button">✕</button></div>
           <div class="portrait-layout">
-            <div><div style="font-size:.75rem;font-weight:800;margin-bottom:6px">Recent solo Gallery images</div><div class="portrait-candidates"></div></div>
+            <div><div style="font-size:.75rem;font-weight:800;margin-bottom:6px">Newest 20 available duels for this artist</div><div class="portrait-candidates"></div></div>
             <div class="portrait-crop-panel">
               <div class="portrait-viewport"><img alt="Crop source"></div>
               <label style="width:280px;font-size:.75rem">Zoom <input class="portrait-zoom" type="range" min="1" max="3" step="0.02" value="1" style="width:100%"></label>
@@ -21080,7 +21363,7 @@ POLISH_UI_JS = r"""
       portraitCandidate = null;
       const modal = ensurePortraitModal();
       modal.querySelector('.portrait-title').textContent = artist;
-      modal.querySelector('.portrait-subtitle').textContent = 'Choose a solo Gallery image, drag it, and zoom to crop a square portrait.';
+      modal.querySelector('.portrait-subtitle').textContent = 'Choose a recent Gallery image, drag it, and zoom to crop a square portrait.';
       const list = modal.querySelector('.portrait-candidates');
       list.innerHTML = '<div style="padding:12px;opacity:.7">Loading solo images…</div>';
       modal.classList.add('is-open'); modal.setAttribute('aria-hidden','false');
@@ -21096,7 +21379,7 @@ POLISH_UI_JS = r"""
       try {
         const data = await waitPortraitResponse(requestId);
         if (!data.ok || !data.candidates?.length) {
-          list.innerHTML = `<div style="padding:12px;opacity:.75">${data.error || 'No solo images found.'}</div>`;
+          list.innerHTML = `<div style="padding:12px;opacity:.75">${data.error || 'No recent images found.'}</div>`;
           return;
         }
         list.innerHTML = '';
@@ -21104,7 +21387,8 @@ POLISH_UI_JS = r"""
           const button = document.createElement('button');
           button.type = 'button'; button.className = 'portrait-candidate';
           const image = document.createElement('img'); image.src = candidate.preview; image.alt = '';
-          const label = document.createElement('span'); label.textContent = `Duel #${candidate.history_number} · ${candidate.side} · ${candidate.date}`;
+          const teamLabel = Number(candidate.team_size||1) === 1 ? 'solo' : Number(candidate.team_size||1) === 2 ? 'duo' : 'trio';
+          const label = document.createElement('span'); label.textContent = `Duel #${candidate.history_number} · ${candidate.side} · ${teamLabel} · ${candidate.date}`;
           button.append(image, label);
           button.addEventListener('click', () => selectPortraitCandidate(candidate, button));
           list.appendChild(button);
@@ -23586,6 +23870,44 @@ ANDROID_APK_PATH = next(
 # DEDICATED_DUEL_PAGE_RANKER_REPAIR_V4
 DEDICATED_DUEL_PAGE_HTML = '\n<!doctype html>\n<html lang="en">\n<head>\n  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">\n  <meta name="theme-color" content="#0b0e12">\n  <meta name="mobile-web-app-capable" content="yes">\n  <meta name="apple-mobile-web-app-capable" content="yes">\n  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">\n  <link rel="manifest" href="/duel/manifest.webmanifest">\n  <link rel="icon" href="/duel/icon-192.png">\n  <title>Artist ELO Duel</title>\n  <style>\n    :root {\n      color-scheme: dark;\n      --bg: #0b0e12;\n      --panel: #151a22;\n      --panel-2: #1c2330;\n      --panel-3: #222b3a;\n      --text: #eef3fb;\n      --muted: #9aa8bc;\n      --line: rgba(255,255,255,.085);\n      --green: #46df82;\n      --green-soft: rgba(70,223,130,.44);\n      --red: #f05252;\n      --red-soft: rgba(240,82,82,.42);\n      --amber: #f5bf4f;\n      --amber-soft: rgba(245,191,79,.45);\n      --blue-soft: rgba(112,168,255,.42);\n      --accent: #70a8ff;\n      --shadow: 0 16px 38px rgba(0,0,0,.34);\n      --radius: 17px;\n    }\n    * { box-sizing: border-box; }\n    html, body { margin:0; min-height:100%; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }\n    body { overscroll-behavior-y: contain; overflow-x:hidden; }\n    button, input, textarea, select { font:inherit; }\n    button { color:inherit; }\n    a { color:#a9ceff; text-decoration:none; }\n    .page { width:min(100%, 1000px); margin:0 auto; padding:8px 8px 30px; }\n    .topbar { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:2px 2px 9px; }\n    .topbar-title { font-weight:760; font-size:1rem; }\n    .top-actions { display:flex; gap:7px; align-items:center; }\n    .pill-btn, .pill-link { min-height:38px; border:1px solid var(--line); border-radius:999px; background:var(--panel); padding:7px 11px; color:var(--text); }\n    .session-strip { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; margin-bottom:8px; }\n    .session-strip[hidden], .duel-type-chip[hidden], .app-screen[hidden] { display:none !important; }\n    .duel-type-chip { display:flex; align-items:center; gap:8px; min-height:38px; margin-bottom:8px; padding:7px 10px; border:1px solid rgba(112,168,255,.24); border-radius:13px; background:linear-gradient(90deg,rgba(112,168,255,.08),var(--panel)); overflow:hidden; }\n    .duel-type-chip span { flex:0 0 auto; color:var(--muted); font-size:.67rem; text-transform:uppercase; letter-spacing:.055em; }\n    .duel-type-chip strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.8rem; }\n    .session-stat { background:var(--panel); border:1px solid rgba(255,255,255,.055); border-radius:13px; padding:8px 10px; min-width:0; }\n    .session-label { color:var(--muted); font-size:.68rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }\n    .session-value { margin-top:3px; font-weight:720; font-size:.91rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }\n    .buffer-strip { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; margin-bottom:8px; }\n    .buffer-chip { display:flex; align-items:center; justify-content:space-between; gap:7px; min-height:39px; background:var(--panel); border:1px solid rgba(255,255,255,.055); border-radius:13px; padding:8px 10px; }\n    .buffer-chip .name { color:var(--muted); font-size:.68rem; }\n    .buffer-chip .number { font-weight:760; font-size:.86rem; white-space:nowrap; }\n    .buffer-chip.refilling .number { color:var(--green); }\n    .buffer-chip.paused .number { color:#ffb86b; }\n    .duel-shell { position:relative; isolation:isolate; background:linear-gradient(180deg,#111720,var(--panel)); border:1px solid var(--line); border-radius:20px; padding:9px; box-shadow:var(--shadow); overflow:hidden; }\n    .duel-shell::after { content:""; position:absolute; inset:0; z-index:0; pointer-events:none; opacity:0; }\n    .duel-shell.feedback-a::after { background:linear-gradient(180deg,rgba(70,223,130,.22),transparent 52%); animation:feedbackWash .42s ease-out; }\n    .duel-shell.feedback-b::after { background:linear-gradient(0deg,rgba(70,223,130,.22),transparent 52%); animation:feedbackWash .42s ease-out; }\n    .duel-shell.feedback-tie::after { background:radial-gradient(circle at center,rgba(245,191,79,.23),transparent 70%); animation:feedbackWash .46s ease-out; }\n    .duel-shell.feedback-bad::after { background:radial-gradient(circle at center,rgba(240,82,82,.25),transparent 72%); animation:feedbackWash .5s ease-out; }\n    .floating-tools { position:absolute; top:7px; left:7px; right:auto; z-index:15; width:38px; height:38px; border-radius:12px; border:1px solid rgba(255,255,255,.15); background:rgba(12,17,24,.86); backdrop-filter:blur(8px); display:grid; place-items:center; font-size:1.2rem; }\n    .gesture-zone, .vote-controls, .compact-actions, .result-card { position:relative; z-index:1; }\n    .gesture-zone { padding-top:2px; touch-action:pan-y; }\n    .duel-grid { display:grid; grid-template-columns:1fr; gap:10px; }\n    .duel-card { position:relative; min-width:0; background:transparent; border:0; border-radius:17px; overflow:visible; transform:scale(var(--scale,1)); transition:transform .075s linear, opacity .075s linear, filter .075s linear; z-index:1; }\n    .image-stage { position:relative; border:1px solid rgba(255,255,255,.08); border-radius:16px; overflow:hidden; background:#080b0f; box-shadow:0 0 0 var(--winner-ring,0px) var(--winner-color,transparent), 0 0 0 var(--loser-ring,0px) var(--loser-color,transparent); transition:box-shadow .075s linear, transform .16s ease, filter .16s ease; user-select:none; -webkit-user-select:none; }\n    .image-stage img { width:100%; height:auto; max-height:48svh; min-height:180px; display:block; object-fit:contain; border-radius:inherit; background:#080b0f; -webkit-user-drag:none; user-select:none; }\n    .image-action-trigger { position:absolute; right:8px; top:8px; z-index:6; width:36px; height:36px; display:grid; place-items:center; border:1px solid rgba(255,255,255,.42); border-radius:999px; background:rgba(9,13,19,.76); color:#fff; font-size:1.12rem; line-height:1; cursor:pointer; touch-action:manipulation; backdrop-filter:blur(7px); }\n    .choice-overlay { position:absolute; inset:0; z-index:5; display:grid; place-items:center; pointer-events:none; opacity:var(--choice-opacity,0); transform:scale(var(--choice-scale,.72)); transition:opacity .075s linear,transform .075s linear; color:#fff; font-size:clamp(3.6rem,16vw,7.8rem); filter:drop-shadow(0 5px 16px rgba(0,0,0,.7)); }\n    .choice-overlay::before { content:""; width:1.22em; height:1.22em; border-radius:999px; background:rgba(8,12,17,.56); border:3px solid currentColor; }\n    .choice-overlay::after { content:""; position:absolute; width:.62em; height:.62em; background:currentColor; -webkit-mask:var(--choice-icon) center/contain no-repeat; mask:var(--choice-icon) center/contain no-repeat; }\n    .choice-overlay[data-choice="win"] { --choice-icon:url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 24 24\'%3E%3Cpath fill=\'none\' stroke=\'black\' stroke-linecap=\'round\' stroke-linejoin=\'round\' stroke-width=\'3.2\' d=\'m3.5 12.5 5 5 12-13\'/%3E%3C/svg%3E"); }\n    .choice-overlay[data-choice="lose"], .choice-overlay[data-choice="bad"] { --choice-icon:url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 24 24\'%3E%3Cpath fill=\'none\' stroke=\'black\' stroke-linecap=\'round\' stroke-width=\'3.2\' d=\'M5 5l14 14M19 5 5 19\'/%3E%3C/svg%3E"); }\n    .choice-overlay[data-choice="tie"] { --choice-icon:url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 24 24\'%3E%3Cpath fill=\'none\' stroke=\'black\' stroke-linecap=\'round\' stroke-width=\'3.2\' d=\'M5 9h14M5 15h14\'/%3E%3C/svg%3E"); }\n    .choice-overlay[data-choice="undo"] { --choice-icon:url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 24 24\'%3E%3Cpath fill=\'none\' stroke=\'black\' stroke-linecap=\'round\' stroke-linejoin=\'round\' stroke-width=\'2.8\' d=\'M9 7 4 12l5 5M5 12h8a6 6 0 0 1 6 6\'/%3E%3C/svg%3E"); }\n    .duel-card.gesture-winner .choice-overlay { color:var(--green); }\n    .duel-card.gesture-loser { opacity:calc(1 - var(--dim,0) * .28); filter:saturate(calc(1 - var(--dim,0) * .25)); }\n    .duel-card.gesture-loser .choice-overlay { color:#ff7b7b; }\n    .duel-card.gesture-tie .choice-overlay { color:var(--amber); }\n    .duel-card.gesture-bad { filter:saturate(.42) brightness(.82); }\n    .duel-card.gesture-bad .choice-overlay { color:#ff7070; }\n    .duel-card.commit-win .image-stage { animation:commitWinner .42s cubic-bezier(.2,.8,.2,1); box-shadow:0 0 0 6px var(--green-soft),0 12px 34px rgba(70,223,130,.2); }\n    .duel-card.commit-lose .image-stage { animation:commitLoser .42s ease-out; box-shadow:0 0 0 4px var(--red-soft); }\n    .duel-card.commit-tie .image-stage { animation:commitTie .44s ease-out; box-shadow:0 0 0 6px var(--amber-soft); }\n    .duel-card.commit-bad .image-stage { animation:commitBad .48s ease-out; box-shadow:0 0 0 6px var(--red-soft); }\n    .duel-card.commit-win .choice-overlay,.duel-card.commit-lose .choice-overlay,.duel-card.commit-tie .choice-overlay,.duel-card.commit-bad .choice-overlay { animation:choicePop .4s ease-out both; opacity:1; transform:scale(1); }\n    .duel-card.commit-win .choice-overlay { color:var(--green); }\n    .duel-card.commit-lose .choice-overlay,.duel-card.commit-bad .choice-overlay { color:#ff7070; }\n    .duel-card.commit-tie .choice-overlay { color:var(--amber); }\n    .artist-strip { display:flex; flex-wrap:wrap; align-items:center; gap:6px; min-height:42px; margin-top:6px; padding:7px 9px 8px; border:1px solid rgba(255,255,255,.065); background:var(--panel-2); border-radius:13px; }\n    .artist-strip[hidden] { display:none; }\n    .artist-label { color:var(--muted); font-size:.66rem; letter-spacing:.08em; text-transform:uppercase; margin-right:1px; }\n    #artistsA, #artistsB { display:contents; }\n    .artist-chip { position:relative; z-index:4; min-height:34px; max-width:100%; border:1px solid rgba(112,168,255,.34); border-radius:999px; background:var(--panel-3); padding:5px 28px 5px 10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; touch-action:manipulation; -webkit-tap-highlight-color:rgba(112,168,255,.18); }\n    .artist-chip::after { content:"⋯"; position:absolute; right:9px; top:50%; transform:translateY(-55%); color:#a9ceff; font-weight:850; letter-spacing:.04em; }\n    .artist-chip:hover, .artist-chip:focus-visible { border-color:rgba(112,168,255,.78); background:#28354a; outline:none; }\n    .artist-chip.has-manual-tags { box-shadow:inset 0 0 0 1px rgba(70,223,130,.42); }\n    .style-tag-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; }\n    .style-tag-toggle { min-height:42px; display:flex; align-items:center; justify-content:flex-start; gap:7px; border:1px solid rgba(255,255,255,.1); border-radius:12px; background:var(--panel-3); padding:7px 10px; color:var(--text); text-align:left; cursor:pointer; touch-action:manipulation; }\n    .style-tag-toggle[aria-pressed="true"] { border-color:rgba(70,223,130,.72); background:#244231; box-shadow:inset 0 0 0 1px rgba(70,223,130,.22); }\n    .style-tag-toggle .style-check { margin-left:auto; color:var(--green); font-weight:900; opacity:0; }\n    .style-tag-toggle[aria-pressed="true"] .style-check { opacity:1; }\n    .style-tag-help { color:var(--muted); font-size:.72rem; line-height:1.35; margin:0 0 7px; }\n    .gesture-hint { color:var(--muted); font-size:.75rem; text-align:center; line-height:1.35; padding:8px 5px 1px; }\n    .vote-controls { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:7px; margin-top:9px; }\n    .vote-controls button, .compact-actions button { min-height:43px; border:1px solid rgba(255,255,255,.09); border-radius:13px; background:#222b39; }\n    #pickA, #tieBtn, #pickB { grid-column:span 2; }\n    #bothBadBtn, #skipBtn { grid-column:span 3; }\n    #pickA { background:#25303e; }\n    #pickB { background:#274024; }\n    #bothBadBtn { background:#432b2b; }\n    .compact-actions { display:grid; grid-template-columns:1fr; gap:7px; margin-top:7px; }\n    .result-card { margin-top:8px; border:1px solid rgba(255,255,255,.065); border-radius:14px; background:rgba(255,255,255,.025); padding:9px 10px; }\n    .result-card.empty { display:none; }\n    .result-title { font-weight:760; line-height:1.25; }\n    .result-subtitle { color:var(--muted); font-size:.78rem; margin-top:2px; }\n    .chance-row { display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:7px; margin-top:8px; }\n    .chance-side { background:var(--panel-2); border-radius:10px; padding:7px 8px; }\n    .chance-side:last-child { text-align:right; }\n    .chance-name { color:var(--muted); font-size:.66rem; text-transform:uppercase; letter-spacing:.07em; }\n    .chance-value { font-weight:780; margin-top:2px; }\n    .chance-vs { color:var(--muted); font-size:.72rem; }\n    .result-sides { display:grid; grid-template-columns:1fr; gap:6px; margin-top:7px; }\n    .result-side { background:var(--panel-2); border-radius:10px; padding:7px 8px; }\n    .result-side-head { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:.75rem; color:var(--muted); margin-bottom:4px; }\n    .result-artist { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:.82rem; padding:2px 0; }\n    .delta-positive { color:var(--green); font-weight:720; }\n    .delta-negative { color:#ff7979; font-weight:720; }\n    .delta-neutral { color:var(--muted); }\n    .result-foot { color:var(--muted); font-size:.69rem; margin-top:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }\n    .status-toast { position:fixed; left:50%; top:max(8px,env(safe-area-inset-top)); transform:translate(-50%,-12px); z-index:100; background:rgba(14,20,29,.94); border:1px solid var(--line); border-radius:999px; padding:7px 12px; opacity:0; pointer-events:none; transition:.16s ease; max-width:90vw; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }\n    .status-toast.show { opacity:1; transform:translate(-50%,0); }\n    .sheet-backdrop { position:fixed; inset:0; z-index:80; background:rgba(0,0,0,.58); display:none; align-items:flex-end; justify-content:center; padding:12px 8px max(12px,env(safe-area-inset-bottom)); }\n    .sheet-backdrop.open { display:flex; }\n    .sheet { width:min(100%,620px); max-height:min(82svh,760px); overflow:auto; background:#151b25; border:1px solid rgba(255,255,255,.1); border-radius:20px; box-shadow:var(--shadow); padding:12px; }\n    .sheet-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:9px; position:sticky; top:-12px; background:#151b25; padding:7px 0 5px; z-index:2; }\n    .sheet-title { font-weight:780; }\n    .sheet-close { width:36px; height:36px; border-radius:11px; border:1px solid var(--line); background:var(--panel-3); }\n    .sheet-section { border-top:1px solid rgba(255,255,255,.07); padding-top:9px; margin-top:9px; }\n    .sheet-section:first-of-type { border-top:0; padding-top:0; margin-top:0; }\n    .sheet-section-title { color:var(--muted); font-size:.68rem; text-transform:uppercase; letter-spacing:.08em; margin-bottom:7px; }\n    .sheet-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; }\n    .sheet-grid button, .sheet-grid a, .sheet-full-btn { display:flex; align-items:center; justify-content:center; text-align:center; min-height:42px; border:1px solid rgba(255,255,255,.09); border-radius:12px; background:var(--panel-3); padding:7px 8px; color:var(--text); }\n    .sheet-grid .wide { grid-column:1/-1; }\n    .sheet label { color:var(--muted); font-size:.76rem; display:block; margin:8px 0 4px; }\n    .sheet input[type=text], .sheet textarea, .sheet select { width:100%; border:1px solid rgba(255,255,255,.09); border-radius:11px; background:#0d1219; color:var(--text); padding:9px 10px; }\n    .sheet textarea { min-height:88px; resize:vertical; }\n    .checkline { display:flex !important; align-items:center; gap:9px; color:var(--text) !important; margin:8px 0 !important; }\n    .checkline input { width:22px; height:22px; flex:0 0 22px; accent-color:var(--accent); }\n    .sheet-message { color:var(--muted); font-size:.75rem; min-height:1.1em; margin-top:7px; }\n    .artist-menu-list { display:flex; flex-wrap:wrap; gap:6px; }\n    .artist-menu-list button { min-height:34px; border-radius:999px; border:1px solid rgba(255,255,255,.1); background:var(--panel-3); padding:5px 10px; }\n    .danger { background:#452929 !important; }\n    .success { background:#26432e !important; }\n    .coverage-panel { margin-top:10px; border:1px solid var(--line); border-radius:16px; background:var(--panel); overflow:hidden; }\n    .coverage-panel summary { cursor:pointer; list-style:none; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:11px 12px; font-weight:740; }\n    .coverage-panel summary::-webkit-details-marker { display:none; }\n    .coverage-summary-value { color:var(--green); font-size:.9rem; }\n    .coverage-body { padding:0 12px 12px; }\n    .coverage-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; }\n    .coverage-stat { background:var(--panel-2); border-radius:11px; padding:8px 9px; min-width:0; }\n    .coverage-stat .label { color:var(--muted); font-size:.66rem; text-transform:uppercase; letter-spacing:.05em; }\n    .coverage-stat .value { margin-top:3px; font-weight:730; font-size:.84rem; overflow:hidden; text-overflow:ellipsis; }\n    .coverage-etas { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; margin-top:8px; }\n    .coverage-eta { background:var(--panel-2); border-radius:11px; padding:8px; text-align:center; }\n    .coverage-eta .target { color:var(--muted); font-size:.66rem; }\n    .coverage-eta .duels { font-weight:750; margin-top:3px; font-size:.8rem; }\n    .coverage-note { color:var(--muted); font-size:.7rem; line-height:1.35; margin-top:8px; }\n    .coverage-head { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:11px 12px; font-weight:740; border-bottom:1px solid rgba(255,255,255,.055); }\n    .coverage-stage-note { color:var(--muted); font-size:.72rem; margin-top:7px; line-height:1.35; }\n    .empty-duel { position:relative; z-index:2; display:none; min-height:min(62svh,680px); place-items:center; padding:30px 18px; text-align:center; }\n    .duel-shell.empty-mode .empty-duel { display:grid; }\n    .duel-shell.empty-mode .gesture-zone,.duel-shell.empty-mode .vote-controls { display:none; }\n    .empty-duel-card { width:min(100%,430px); padding:24px 20px; border:1px solid rgba(255,255,255,.08); border-radius:18px; background:var(--panel-2); box-shadow:0 14px 36px rgba(0,0,0,.24); }\n    .empty-duel-spinner { width:48px; height:48px; margin:0 auto 15px; border:4px solid rgba(255,255,255,.12); border-top-color:var(--accent); border-radius:50%; animation:spin .9s linear infinite; }\n    .empty-duel-icon { display:none; width:50px; height:50px; margin:0 auto 14px; place-items:center; border:1px solid var(--line); border-radius:16px; background:var(--panel-3); font-size:1.45rem; }\n    .empty-duel-title { font-weight:800; font-size:1.02rem; }\n    .empty-duel-message { color:var(--muted); margin-top:7px; font-size:.82rem; line-height:1.45; }\n    .empty-duel button { min-height:42px; margin-top:16px; padding:8px 15px; border:1px solid rgba(112,168,255,.48); border-radius:12px; background:#24354c; color:var(--text); }\n    .duel-shell.empty-error .empty-duel-spinner,.duel-shell.empty-paused .empty-duel-spinner { display:none; }\n    .duel-shell.empty-error .empty-duel-icon,.duel-shell.empty-paused .empty-duel-icon { display:grid; }\n    @keyframes spin { to { transform:rotate(360deg); } }\n    @keyframes feedbackWash { 0%{opacity:0} 20%{opacity:1} 100%{opacity:0} }\n    @keyframes choicePop { 0%{opacity:0;transform:scale(.68)} 24%{opacity:1;transform:scale(1.06)} 72%{opacity:1;transform:scale(1)} 100%{opacity:0;transform:scale(1.08)} }\n    @keyframes commitWinner { 0%{transform:scale(1)} 42%{transform:scale(1.025)} 100%{transform:scale(1)} }\n    @keyframes commitLoser { 0%{transform:scale(1);filter:none} 42%{transform:scale(.985);filter:saturate(.65)} 100%{transform:scale(1);filter:none} }\n    @keyframes commitTie { 0%{transform:scale(1)} 35%{transform:scale(1.012)} 70%{transform:scale(.996)} 100%{transform:scale(1)} }\n    @keyframes commitBad { 0%{filter:none} 36%{filter:saturate(.3) brightness(.75)} 100%{filter:none} }\n    @media (prefers-reduced-motion:reduce) { .duel-shell::after,.choice-overlay,.image-stage,.duel-card,.empty-duel-spinner { animation-duration:.001ms !important; transition-duration:.001ms !important; } }\n\n\n    .app-screen[hidden] { display:none !important; }\n    .screen-ribbon { --ribbon-offset:0px; --ribbon-progress:0; position:relative; isolation:isolate; overflow:hidden; width:100%; min-height:54px; margin-top:12px; display:flex; align-items:center; justify-content:center; gap:10px; border:1px solid rgba(112,168,255,.3); border-radius:16px; background:linear-gradient(90deg,rgba(112,168,255,.08),rgba(112,168,255,.2),rgba(112,168,255,.08)); color:var(--text); font-weight:790; letter-spacing:.01em; touch-action:pan-y; user-select:none; transform:translateX(var(--ribbon-offset)); transition:transform .2s cubic-bezier(.2,.8,.2,1),border-color .2s ease,box-shadow .2s ease; }\n    .screen-ribbon::after { content:""; position:absolute; inset:0; z-index:-1; opacity:calc(var(--ribbon-progress) * .72); background:linear-gradient(90deg,transparent,rgba(112,168,255,.42),transparent); transform:translateX(var(--ribbon-offset)); transition:opacity .16s ease; }\n    .screen-ribbon.dragging { transition:none; border-color:rgba(112,168,255,.72); box-shadow:0 8px 25px rgba(42,99,176,calc(var(--ribbon-progress) * .28)); }\n    .screen-ribbon.dragging::after { transition:none; }\n    .screen-ribbon.dual { justify-content:space-between; padding:0 14px; }\n    .screen-ribbon .ribbon-label-stack { display:flex; align-items:center; justify-content:space-between; gap:8px; text-align:center; flex:1 1 auto; min-width:0; }\n    .screen-ribbon .ribbon-destination { display:flex; align-items:center; gap:7px; min-width:0; font-size:.88rem; white-space:nowrap; }\n    .screen-ribbon .ribbon-destination:last-child { justify-content:flex-end; }\n    .screen-ribbon .ribbon-gesture { color:#bcd8ff; font-size:1.08rem; font-weight:900; }\n    .screen-ribbon .ribbon-center { color:var(--muted); font-size:.68rem; letter-spacing:.06em; text-transform:uppercase; white-space:nowrap; }\n    .screen-ribbon .ribbon-handle { width:46px; height:5px; border-radius:999px; background:rgba(255,255,255,.32); }\n    .screen-ribbon .ribbon-arrow { width:22px; height:22px; display:grid; place-items:center; flex:0 0 22px; }\n    .screen-ribbon .ribbon-arrow::before { content:""; width:13px; height:13px; border-top:2px solid currentColor; border-right:2px solid currentColor; }\n    .screen-ribbon .ribbon-arrow.left::before { transform:rotate(-135deg); }\n    .screen-ribbon .ribbon-arrow.right::before { transform:rotate(45deg); }\n    .screen-ribbon.return-left .ribbon-arrow::before { transform:rotate(-135deg); }\n    .screen-ribbon.return-right .ribbon-arrow::before { transform:rotate(45deg); }\n    .app-only { display:none !important; }\n    body.native-app .app-only:not([hidden]) { display:flex !important; }\n    body.native-app main.app-only:not([hidden]) { display:block !important; }\n    .screen-enter-forward { animation:screenInForward .24s ease-out both; }\n    .screen-enter-back { animation:screenInBack .24s ease-out both; }\n    @keyframes screenInForward { from{opacity:.35;transform:translateX(28px)} to{opacity:1;transform:none} }\n    @keyframes screenInBack { from{opacity:.35;transform:translateX(-28px)} to{opacity:1;transform:none} }\n    .generation-header { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:6px 2px 10px; }\n    .generation-title { font-size:1.08rem; font-weight:820; }\n    .generation-subtitle { color:var(--muted); font-size:.74rem; margin-top:2px; }\n    .generation-card { border:1px solid var(--line); border-radius:18px; background:var(--panel); padding:12px; box-shadow:var(--shadow); }\n    .generation-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px; }\n    .generation-field { min-width:0; }\n    .generation-field.wide { grid-column:1/-1; }\n    .generation-field label, .prompt-details summary, .generation-section-title { color:var(--muted); font-size:.72rem; font-weight:760; letter-spacing:.035em; }\n    .generation-field input[type=number], .generation-field select, .generation-field input[type=text], .generation-field textarea { width:100%; min-height:43px; margin-top:5px; border:1px solid rgba(255,255,255,.1); border-radius:11px; background:#0d1219; color:var(--text); padding:9px 10px; }\n    .generation-field textarea { min-height:156px; resize:vertical; line-height:1.42; }\n    .generation-field.compact-textarea textarea { min-height:88px; }\n    .generation-help { margin-top:5px; color:var(--muted); font-size:.67rem; line-height:1.35; }\n    .generation-switch { min-height:43px; display:flex; align-items:center; gap:9px; border:1px solid rgba(255,255,255,.08); border-radius:11px; background:var(--panel-2); padding:8px 10px; }\n    .generation-switch input { width:22px; height:22px; accent-color:var(--accent); }\n    .prompt-details { margin-top:10px; border:1px solid rgba(255,255,255,.08); border-radius:13px; background:var(--panel-2); overflow:hidden; }\n    .prompt-details summary { min-height:46px; display:flex; align-items:center; justify-content:space-between; cursor:pointer; padding:10px 12px; list-style:none; color:var(--text); }\n    .prompt-details summary::-webkit-details-marker { display:none; }\n    .prompt-details summary::after { content:"＋"; color:var(--muted); font-size:1.15rem; line-height:1; }\n    .prompt-details[open] summary::after { content:"−"; }\n    .prompt-details .prompt-body { padding:0 10px 10px; }\n    .prompt-details textarea { width:100%; min-height:180px; border:1px solid rgba(255,255,255,.09); border-radius:11px; background:#0d1219; color:var(--text); padding:10px; resize:vertical; line-height:1.42; }\n    .generation-section { margin-top:12px; padding-top:12px; border-top:1px solid rgba(255,255,255,.07); }\n    .mobile-profile-editor { margin-top:10px; padding:10px; border:1px solid rgba(112,168,255,.22); border-radius:15px; background:linear-gradient(145deg,rgba(112,168,255,.06),rgba(255,255,255,.018)); }\n    .profile-ownership-help { margin:8px 0 2px; padding:9px 10px; border:1px solid rgba(255,255,255,.09); border-radius:11px; background:var(--panel-2); color:var(--muted); font-size:.69rem; line-height:1.42; }\n    .profile-ownership-help strong { display:block; margin-bottom:3px; color:var(--text); font-size:.74rem; }\n    .profile-settings-details { margin-top:9px; }\n    .profile-settings-details summary { gap:8px; }\n    .profile-rule-pill { margin-left:auto; max-width:54%; padding:4px 7px; border-radius:999px; background:rgba(112,168,255,.13); color:#b9d6ff; font-size:.59rem; font-weight:760; line-height:1.18; text-align:center; }\n    .profile-settings-details.complete .profile-rule-pill { background:rgba(153,115,255,.16); color:#d7c8ff; }\n    .profile-settings-details summary::after { flex:0 0 auto; }\n    .generation-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:9px; }\n    .generation-actions button { min-height:42px; flex:1 1 130px; border:1px solid rgba(255,255,255,.1); border-radius:11px; background:var(--panel-3); color:var(--text); padding:8px 10px; }\n    .generation-actions button.primary { border-color:rgba(112,168,255,.58); background:#29415f; }\n    .generation-actions button.danger { background:#452929; }\n    .preset-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px; margin-top:7px; }\n    .preset-row select, .preset-row input { min-width:0; min-height:43px; border:1px solid rgba(255,255,255,.1); border-radius:11px; background:#0d1219; color:var(--text); padding:8px 10px; }\n    .preset-row button { min-width:88px; border:1px solid rgba(255,255,255,.1); border-radius:11px; background:var(--panel-3); color:var(--text); }\n    .rotation-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; margin-top:8px; }\n    .rotation-choice { display:flex; align-items:center; gap:8px; min-height:42px; border:1px solid rgba(255,255,255,.08); border-radius:11px; background:var(--panel-2); padding:8px 9px; overflow:hidden; }\n    .rotation-choice input { width:20px; height:20px; flex:0 0 20px; accent-color:var(--accent); }\n    .rotation-choice span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }\n    .generation-status { min-height:1.3em; margin-top:9px; color:var(--muted); font-size:.76rem; line-height:1.4; }\n    .generation-loading { min-height:48vh; display:grid; place-items:center; color:var(--muted); text-align:center; }\n    .sheet-backdrop { z-index:180; }\n    .artist-ladder-page, .gallery-page { padding-bottom:26px; }\n    .ladder-toolbar { position:sticky; top:0; z-index:24; padding:7px 0 9px; background:linear-gradient(180deg,var(--bg) 78%,rgba(11,14,18,.86),transparent); backdrop-filter:blur(12px); }\n    .ladder-search-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px; }\n    .ladder-search-row input, .ladder-controls select { width:100%; min-height:44px; border:1px solid rgba(255,255,255,.1); border-radius:13px; background:#0d1219; color:var(--text); padding:9px 11px; }\n    .ladder-controls { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto; gap:7px; margin-top:7px; }\n    .ladder-favorite-toggle { min-height:44px; border:1px solid rgba(255,255,255,.1); border-radius:13px; background:var(--panel); color:var(--muted); padding:7px 10px; white-space:nowrap; }\n    .ladder-favorite-toggle.active { border-color:rgba(245,191,79,.62); background:#433820; color:#ffe29a; }\n    .ladder-summary { display:flex; align-items:center; justify-content:space-between; gap:8px; color:var(--muted); font-size:.72rem; padding:8px 3px 1px; }\n    .ladder-list { display:grid; gap:9px; }\n    .ladder-card { position:relative; border:1px solid rgba(255,255,255,.075); border-radius:16px; background:linear-gradient(180deg,#171e29,var(--panel)); overflow:hidden; box-shadow:0 9px 23px rgba(0,0,0,.18); }\n    .ladder-card-main { width:100%; border:0; background:transparent; color:inherit; padding:11px 62px 11px 11px; text-align:left; }\n    .ladder-card-head { display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:9px; }\n    .ladder-rank { min-width:42px; height:42px; display:grid; place-items:center; border-radius:13px; background:var(--panel-3); color:#bed7ff; font-size:.78rem; font-weight:850; }\n    .ladder-name { min-width:0; font-weight:820; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }\n    .ladder-stage { margin-top:3px; color:var(--muted); font-size:.68rem; }\n    .ladder-star { position:absolute; top:11px; right:11px; z-index:2; width:42px; height:42px; border:1px solid rgba(255,255,255,.1); border-radius:13px; background:var(--panel-2); color:var(--muted); font-size:1.2rem; }\n    .ladder-star.active { color:var(--amber); border-color:rgba(245,191,79,.48); }\n    .ladder-metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px; margin-top:9px; }\n    .ladder-metric { min-width:0; padding:7px; border-radius:10px; background:rgba(255,255,255,.035); }\n    .ladder-metric span { display:block; color:var(--muted); font-size:.59rem; text-transform:uppercase; letter-spacing:.045em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }\n    .ladder-metric strong { display:block; margin-top:3px; font-size:.76rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }\n    .ladder-badges { display:flex; gap:5px; flex-wrap:wrap; margin-top:8px; }\n    .ladder-badge { max-width:100%; border-radius:999px; background:var(--panel-3); color:#c8d5e8; padding:4px 7px; font-size:.61rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }\n    .ladder-load-more { width:100%; min-height:46px; margin-top:11px; border:1px solid rgba(112,168,255,.42); border-radius:14px; background:#21344e; color:var(--text); font-weight:780; }\n    .ladder-empty { min-height:48svh; display:grid; place-items:center; text-align:center; color:var(--muted); padding:30px 20px; border:1px dashed rgba(255,255,255,.1); border-radius:17px; }\n    .gallery-page { padding-bottom:26px; }\n    .mobile-gallery-toolbar { position:sticky; top:0; z-index:24; padding:7px 0 9px; background:linear-gradient(180deg,var(--bg) 78%,rgba(11,14,18,.86),transparent); backdrop-filter:blur(12px); }\n    .gallery-search-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:7px; }\n    .gallery-search-row input { width:100%; min-height:44px; border:1px solid rgba(255,255,255,.1); border-radius:13px; background:#0d1219; color:var(--text); padding:9px 12px; }\n    .gallery-icon-btn { min-width:44px; min-height:44px; border:1px solid var(--line); border-radius:13px; background:var(--panel); color:var(--text); font-weight:800; }\n    .gallery-quick-filters { display:flex; gap:7px; overflow-x:auto; padding:8px 1px 2px; scrollbar-width:none; }\n    .gallery-quick-filters::-webkit-scrollbar { display:none; }\n    .gallery-filter-chip { flex:0 0 auto; min-height:34px; border:1px solid rgba(255,255,255,.09); border-radius:999px; background:var(--panel); color:var(--muted); padding:6px 11px; }\n    .gallery-filter-chip.active { border-color:rgba(112,168,255,.62); background:#243a57; color:var(--text); }\n    .gallery-summary { display:flex; justify-content:space-between; gap:9px; align-items:center; color:var(--muted); font-size:.73rem; padding:7px 3px 1px; }\n    .gallery-list { display:grid; gap:10px; }\n    .gallery-duel-card { position:relative; border:1px solid rgba(255,255,255,.075); border-radius:17px; background:linear-gradient(180deg,#151b24,var(--panel)); overflow:hidden; box-shadow:0 10px 24px rgba(0,0,0,.2); }\n    .gallery-card-button { width:100%; display:block; border:0; padding:0; background:transparent; color:inherit; text-align:left; }\n    .gallery-card-images { position:relative; display:grid; grid-template-columns:1fr 1fr; gap:2px; min-height:170px; background:#070a0e; }\n    .gallery-card-side { position:relative; min-width:0; overflow:hidden; background:#090d12; }\n    .gallery-card-side img { width:100%; height:clamp(170px,44vw,255px); object-fit:cover; display:block; }\n    .gallery-image-missing { height:clamp(170px,44vw,255px); display:grid; place-items:center; color:var(--muted); font-size:.76rem; text-align:center; padding:10px; background:repeating-linear-gradient(135deg,#10161f,#10161f 12px,#0c1118 12px,#0c1118 24px); }\n    .gallery-side-letter { position:absolute; left:7px; bottom:7px; min-width:27px; height:27px; display:grid; place-items:center; border-radius:9px; background:rgba(8,12,17,.76); border:1px solid rgba(255,255,255,.18); font-weight:850; font-size:.75rem; }\n    .gallery-outcome-badge { position:absolute; left:50%; top:8px; transform:translateX(-50%); z-index:3; min-height:28px; display:flex; align-items:center; justify-content:center; max-width:72%; border-radius:999px; padding:5px 10px; background:rgba(8,12,17,.82); border:1px solid rgba(255,255,255,.18); font-weight:850; font-size:.7rem; white-space:nowrap; }\n    .gallery-outcome-badge.a,.gallery-outcome-badge.b { color:var(--green); }\n    .gallery-outcome-badge.tie { color:var(--amber); }\n    .gallery-outcome-badge.bad,.gallery-outcome-badge.invalid { color:#ff7777; }\n    .gallery-card-side.winner { box-shadow:inset 0 0 0 3px rgba(70,223,130,.55); }\n    .gallery-card-side.loser { filter:saturate(.72) brightness(.9); }\n    .gallery-card-side.tie { box-shadow:inset 0 0 0 3px rgba(245,191,79,.48); }\n    .gallery-card-side.bad,.gallery-card-side.invalid { filter:saturate(.42) brightness(.78); box-shadow:inset 0 0 0 3px rgba(240,82,82,.45); }\n    .gallery-card-body { padding:9px 10px 10px; }\n    .gallery-card-head { display:flex; justify-content:space-between; gap:8px; align-items:center; }\n    .gallery-card-date { color:var(--muted); font-size:.69rem; }\n    .gallery-card-star { color:var(--amber); font-size:1rem; min-width:20px; text-align:right; }\n    .gallery-matchup { display:grid; grid-template-columns:1fr auto 1fr; gap:7px; align-items:start; margin-top:7px; }\n    .gallery-matchup-side { min-width:0; font-size:.78rem; font-weight:720; line-height:1.28; overflow-wrap:anywhere; }\n    .gallery-matchup-side.right { text-align:right; }\n    .gallery-vs { color:var(--muted); font-size:.64rem; font-weight:850; padding-top:2px; }\n    .gallery-card-meta { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }\n    .gallery-meta-pill { min-height:25px; display:flex; align-items:center; max-width:100%; border-radius:999px; background:var(--panel-2); color:var(--muted); padding:4px 8px; font-size:.64rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }\n    .gallery-empty { min-height:48svh; display:grid; place-items:center; text-align:center; color:var(--muted); padding:30px 20px; border:1px dashed rgba(255,255,255,.1); border-radius:17px; }\n    .gallery-load-more { width:100%; min-height:46px; margin-top:11px; border:1px solid rgba(112,168,255,.42); border-radius:14px; background:#21344e; color:var(--text); font-weight:780; }\n    .gallery-load-more[hidden] { display:none; }\n    .gallery-viewer { position:fixed; inset:0; z-index:120; display:none; flex-direction:column; background:var(--bg); overflow-y:auto; overscroll-behavior:contain; }\n    .gallery-viewer.open { display:flex; }\n    .gallery-viewer-head { position:sticky; top:0; z-index:4; display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:8px; min-height:58px; padding:calc(7px + env(safe-area-inset-top)) 8px 7px; background:rgba(11,14,18,.92); border-bottom:1px solid var(--line); backdrop-filter:blur(12px); }\n    .gallery-viewer-title { min-width:0; text-align:center; }\n    .gallery-viewer-title strong { display:block; font-size:.92rem; }\n    .gallery-viewer-title span { display:block; color:var(--muted); font-size:.68rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }\n    .gallery-viewer-scroll { width:min(100%,960px); margin:0 auto; padding:8px 7px calc(22px + env(safe-area-inset-bottom)); }\n    .gallery-viewer-nav { display:grid; grid-template-columns:1fr auto 1fr; gap:8px; align-items:center; margin-bottom:8px; }\n    .gallery-viewer-nav button { min-height:40px; border:1px solid var(--line); border-radius:12px; background:var(--panel); }\n    .gallery-viewer-nav button:last-child { grid-column:3; }\n    .gallery-viewer-images { display:grid; grid-template-columns:1fr; gap:10px; }\n    .gallery-viewer-side { border:1px solid rgba(255,255,255,.08); border-radius:17px; background:var(--panel); overflow:hidden; }\n    .gallery-viewer-side.winner { box-shadow:0 0 0 4px rgba(70,223,130,.36); }\n    .gallery-viewer-side.tie { box-shadow:0 0 0 4px rgba(245,191,79,.32); }\n    .gallery-viewer-side.bad,.gallery-viewer-side.invalid { box-shadow:0 0 0 4px rgba(240,82,82,.34); }\n    .gallery-viewer-image { width:100%; min-height:210px; max-height:72svh; object-fit:contain; display:block; background:#070a0e; }\n    .gallery-viewer-side.image-missing::before { content:"Image file missing"; min-height:240px; display:grid; place-items:center; color:var(--muted); background:repeating-linear-gradient(135deg,#10161f,#10161f 12px,#0c1118 12px,#0c1118 24px); }\n    .gallery-viewer-side.image-missing .gallery-viewer-image { display:none; }\n    .gallery-viewer-side-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 9px; border-top:1px solid rgba(255,255,255,.06); }\n    .gallery-viewer-artists { display:flex; flex-wrap:wrap; gap:6px; padding:0 8px 9px; }\n    .gallery-viewer-artists .artist-chip { padding-right:10px; }\n    .gallery-viewer-actions { position:sticky; bottom:0; z-index:3; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px; padding:8px; margin-top:9px; background:rgba(11,14,18,.93); border:1px solid var(--line); border-radius:15px; backdrop-filter:blur(12px); }\n    .gallery-viewer-actions button { min-height:43px; border:1px solid rgba(255,255,255,.1); border-radius:11px; background:var(--panel-2); color:var(--text); font-size:.72rem; font-weight:750; padding:6px; }\n    .gallery-viewer-actions button.primary { background:#29415f; border-color:rgba(112,168,255,.5); }\n    .gallery-detail-card { margin-top:10px; border:1px solid var(--line); border-radius:15px; background:var(--panel); overflow:hidden; }\n    .gallery-detail-card summary { min-height:44px; display:flex; align-items:center; justify-content:space-between; list-style:none; cursor:pointer; padding:9px 11px; font-weight:780; }\n    .gallery-detail-card summary::-webkit-details-marker { display:none; }\n    .gallery-detail-body { padding:0 11px 11px; color:var(--muted); font-size:.75rem; line-height:1.45; }\n    .gallery-detail-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; }\n    .gallery-detail-stat { min-width:0; border-radius:10px; background:var(--panel-2); padding:8px; }\n    .gallery-detail-stat strong { display:block; color:var(--text); overflow-wrap:anywhere; }\n    .gallery-prompt { white-space:pre-wrap; overflow-wrap:anywhere; max-height:240px; overflow:auto; border-radius:10px; background:#0d1219; padding:9px; color:#cfd9e8; }\n    .gallery-filter-form { display:grid; gap:9px; }\n    .gallery-filter-form input,.gallery-filter-form select,.gallery-filter-form textarea { width:100%; min-height:42px; border:1px solid rgba(255,255,255,.1); border-radius:10px; background:#0d1219; color:var(--text); padding:8px 10px; }\n    .gallery-filter-form label { color:var(--muted); font-size:.72rem; }\n    .gallery-filter-form .checkline { min-height:40px; }\n    @media (min-width:780px) { .gallery-viewer-images { grid-template-columns:1fr 1fr; } .gallery-card-images { min-height:250px; } .gallery-card-side img,.gallery-image-missing { height:280px; } }\n    @media (max-width:620px) { .generation-grid,.rotation-list { grid-template-columns:1fr; } }\n\n    @media (min-width:850px) {\n      .duel-grid { grid-template-columns:1fr 1fr; }\n      .image-stage img { max-height:72vh; }\n      .result-sides { grid-template-columns:1fr 1fr; }\n    }\n    @media (max-width:620px) {\n      .page { padding-left:5px; padding-right:5px; }\n      .duel-shell { padding:7px; border-radius:15px; }\n      .session-strip, .buffer-strip { grid-template-columns:repeat(2,minmax(0,1fr)); }\n      .ladder-metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }\n      .ladder-controls { grid-template-columns:minmax(0,1fr) minmax(0,1fr); }\n      .ladder-favorite-toggle { grid-column:1/-1; }\n      .coverage-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }\n      .coverage-etas { grid-template-columns:repeat(2,minmax(0,1fr)); }\n      .topbar-title { display:none; }\n      .topbar { justify-content:flex-end; }\n      .pill-link { font-size:.78rem; }\n      .sheet { border-radius:18px; }\n    }\n  </style>\n</head>\n<body>\n  <main class="page app-screen" id="duelPage">\n    <header class="topbar">\n      <div class="topbar-title">Artist ELO Duel</div>\n      <div class="top-actions">\n        <button class="pill-btn" id="installBtn" type="button">Update app</button>\n        <a class="pill-link" href="/ranker/">Full ranker</a>\n        <button class="pill-btn" id="refreshBtn" type="button">Refresh</button>\n      </div>\n    </header>\n\n    <section class="buffer-strip" aria-label="Duel buffer status">\n      <div class="buffer-chip"><span class="name">Ready</span><span class="number" id="bufferReady">—</span></div>\n      <div class="buffer-chip"><span class="name">Queued</span><span class="number" id="bufferQueued">—</span></div>\n      <div class="buffer-chip" id="bufferRefillChip"><span class="name">Generator</span><span class="number" id="bufferRefill">—</span></div>\n      <div class="buffer-chip"><span class="name">Target</span><span class="number" id="bufferTarget">—</span></div>\n    </section>\n\n    <section class="session-strip" aria-label="Session statistics">\n      <div class="session-stat"><div class="session-label">Active time</div><div class="session-value" id="sessionTime">00:00</div></div>\n      <div class="session-stat"><div class="session-label">Session duels</div><div class="session-value" id="sessionDuels">0</div></div>\n      <div class="session-stat"><div class="session-label">Pace</div><div class="session-value" id="sessionPace">0 / hr</div></div>\n      <div class="session-stat"><div class="session-label" id="etaLabel">Next coverage goal</div><div class="session-value" id="etaText">—</div></div>\n    </section>\n\n    <section class="duel-type-chip" id="duelTypeChip" aria-label="Current duel type"><span>Duel type</span><strong id="duelTypeText">—</strong></section>\n\n    <section class="duel-shell" id="duelShell">\n      <button class="floating-tools" id="toolsButton" type="button" aria-label="Duel tools">⋯</button>\n      <section class="empty-duel" id="emptyDuel" aria-live="polite">\n        <div class="empty-duel-card">\n          <div class="empty-duel-spinner" aria-hidden="true"></div>\n          <div class="empty-duel-icon" id="emptyDuelIcon" aria-hidden="true">◌</div>\n          <div class="empty-duel-title" id="emptyDuelTitle">Generating the next duel</div>\n          <div class="empty-duel-message" id="emptyDuelMessage">The buffer is empty. This screen will update automatically as soon as the next comparison is ready.</div>\n          <button id="emptyRefreshBtn" type="button">Check again</button>\n        </div>\n      </section>\n      <div class="gesture-zone" id="gestureZone">\n        <div class="duel-grid">\n          <article class="duel-card" id="cardA" data-side="A">\n            <div class="image-stage" id="stageA">\n              <img id="imgA" alt="Duel image A">\n              <div class="choice-overlay" id="overlayA" aria-hidden="true" data-choice=""></div>\n              <button class="image-action-trigger" type="button" data-side-menu="A" aria-label="Image A actions">⋯</button>\n            </div>\n            <div class="artist-strip" id="artistStripA" hidden>\n              <span class="artist-label">A</span><span id="artistsA"></span>\n            </div>\n          </article>\n          <article class="duel-card" id="cardB" data-side="B">\n            <div class="image-stage" id="stageB">\n              <img id="imgB" alt="Duel image B">\n              <div class="choice-overlay" id="overlayB" aria-hidden="true" data-choice=""></div>\n              <button class="image-action-trigger" type="button" data-side-menu="B" aria-label="Image B actions">⋯</button>\n            </div>\n            <div class="artist-strip" id="artistStripB" hidden>\n              <span class="artist-label">B</span><span id="artistsB"></span>\n            </div>\n          </article>\n        </div>\n        <div class="gesture-hint">Horizontal swipe chooses • 2 fingers down = Tie • 3 down = Both bad • 3 up = Undo</div>\n      </div>\n\n      <div class="vote-controls">\n        <button id="pickA" type="button">Pick A</button>\n        <button id="tieBtn" type="button">Tie</button>\n        <button id="pickB" type="button">Pick B</button>\n        <button id="bothBadBtn" type="button">Both bad</button>\n        <button id="skipBtn" type="button">Skip</button>\n      </div>\n      <div class="compact-actions"><button id="undoBtn" type="button">Undo</button></div>\n\n      <section class="result-card empty" id="resultCard" aria-live="polite">\n        <div class="result-title" id="resultTitle"></div>\n        <div class="result-subtitle" id="resultSubtitle"></div>\n        <div class="chance-row" id="chanceRow" hidden>\n          <div class="chance-side"><div class="chance-name">Side A chance</div><div class="chance-value" id="chanceA">50%</div></div>\n          <div class="chance-vs">vs</div>\n          <div class="chance-side"><div class="chance-name">Side B chance</div><div class="chance-value" id="chanceB">50%</div></div>\n        </div>\n        <div class="result-sides" id="resultSides"></div>\n        <div class="result-foot" id="resultFoot"></div>\n      </section>\n    </section>\n\n    <section class="coverage-panel" id="coveragePanel" aria-label="Coverage and duel system">\n      <div class="coverage-head"><span>Coverage and duel system</span><span class="coverage-summary-value" id="coverageSummary">—</span></div>\n      <div class="coverage-body">\n        <div class="coverage-grid">\n          <div class="coverage-stat"><div class="label">Discovery coverage</div><div class="value" id="coverageDiscovery">—</div></div>\n          <div class="coverage-stat"><div class="label">2+ match coverage</div><div class="value" id="coverageFollowup">—</div></div>\n          <div class="coverage-stat"><div class="label">Evaluated</div><div class="value" id="coverageSeen">—</div></div>\n          <div class="coverage-stat"><div class="label">Unseen</div><div class="value" id="coverageUnseen">—</div></div>\n          <div class="coverage-stat"><div class="label">One match</div><div class="value" id="coverageOneMatch">—</div></div>\n          <div class="coverage-stat"><div class="label">Two or more</div><div class="value" id="coverageTwoPlus">—</div></div>\n          <div class="coverage-stat"><div class="label">Mode</div><div class="value" id="coverageMode">—</div></div>\n          <div class="coverage-stat"><div class="label">Recent progress</div><div class="value" id="coverageRate">—</div></div>\n        </div>\n        <div class="coverage-etas" id="coverageEtas"></div>\n        <div class="coverage-note" id="coverageNote">ETA uses recent first and second appearances from completed duels.</div>\n      </div>\n    </section>\n\n    <button class="screen-ribbon dual" id="navigationRibbon" type="button" aria-label="Swipe right for Gallery or swipe left for generation controls">\n      <span class="ribbon-label-stack"><span class="ribbon-destination"><strong>Gallery</strong><span class="ribbon-gesture" aria-hidden="true">→</span></span><span class="ribbon-center">pull screen</span><span class="ribbon-destination"><span class="ribbon-gesture" aria-hidden="true">←</span><strong>Generation</strong></span></span>\n    </button>\n  </main>\n\n  <main class="page app-screen artist-ladder-page app-only" id="artistLadderPage" hidden>\n    <header class="generation-header"><div><div class="generation-title">Artist Ladder</div><div class="generation-subtitle">Phone-native rankings and artist actions.</div></div><button class="pill-btn" id="artistLadderClose" type="button">Back to Gallery</button></header>\n    <div class="ladder-toolbar">\n      <div class="ladder-search-row"><input id="artistLadderSearch" type="search" placeholder="Search artists, tags, badges, notes…" autocomplete="off"><button class="gallery-icon-btn" id="artistLadderRefresh" type="button" aria-label="Refresh artist ladder">↻</button></div>\n      <div class="ladder-controls"><select id="artistLadderSort" aria-label="Artist ladder sorting"><option value="top">Top-search score</option><option value="potential">Potential</option><option value="top50">Top-50 probability</option><option value="uncertainty">Most uncertain</option><option value="duels">Most duels</option><option value="alphabetical">Alphabetical</option></select><select id="artistLadderStage" aria-label="Artist stage filter"><option value="">All stages</option><option value="Elite">Elite</option><option value="Established">Established</option><option value="Qualification">Qualification</option><option value="Screening">Screening</option><option value="Opening">Opening</option><option value="Unseen">Unseen</option></select><button class="ladder-favorite-toggle" id="artistLadderFavorites" type="button">★ Favorites only</button></div>\n      <div class="ladder-summary"><span id="artistLadderSummary">Loading artists…</span><span id="artistLadderPosition"></span></div>\n    </div>\n    <div class="ladder-list" id="artistLadderList"></div><button class="ladder-load-more" id="artistLadderLoadMore" type="button" hidden>Load more artists</button>\n    <button class="screen-ribbon return-left" id="artistLadderReturnRibbon" type="button" aria-label="Swipe left or tap to return to Gallery"><span class="ribbon-arrow" aria-hidden="true"></span><span>Swipe left to Gallery</span><span class="ribbon-handle" aria-hidden="true"></span></button>\n  </main>\n\n  <main class="page app-screen gallery-page" id="galleryPage" hidden>\n    <header class="generation-header">\n      <div><div class="generation-title">Gallery</div><div class="generation-subtitle">Historical duels, designed for phone browsing.</div></div>\n      <button class="pill-btn" id="galleryClose" type="button">Back to duel</button>\n    </header>\n    <button class="screen-ribbon app-only return-right" id="galleryArtistRibbon" type="button" aria-label="Swipe right or tap to open Artist Ladder"><span class="ribbon-handle" aria-hidden="true"></span><span>Artist Ladder</span><span class="ribbon-arrow" aria-hidden="true"></span></button>\n    <div class="mobile-gallery-toolbar">\n      <div class="gallery-search-row">\n        <input id="gallerySearch" type="search" placeholder="Search artists, seed, preset, match type…" autocomplete="off">\n        <button class="gallery-icon-btn" id="galleryFilterButton" type="button" aria-label="Gallery filters">Filters</button>\n        <button class="gallery-icon-btn" id="galleryRefresh" type="button" aria-label="Refresh gallery">↻</button>\n      </div>\n      <div class="gallery-quick-filters" aria-label="Quick gallery filters">\n        <button class="gallery-filter-chip" id="galleryQuickSolo" type="button" aria-pressed="false">Solo</button>\n        <button class="gallery-filter-chip" id="galleryQuickDuo" type="button" aria-pressed="false">Duo</button>\n        <button class="gallery-filter-chip" id="galleryQuickTrio" type="button" aria-pressed="false">Trio</button>\n        <button class="gallery-filter-chip" id="galleryQuickFavorites" type="button">★ Favorites</button>\n        <button class="gallery-filter-chip" id="galleryQuickBothBad" type="button">Both bad</button>\n        <button class="gallery-filter-chip" id="galleryQuickMissing" type="button">Missing images</button>\n      </div>\n      <div class="gallery-summary"><span id="gallerySummary">Loading history…</span><span id="galleryActiveFilterCount"></span></div>\n    </div>\n    <div class="gallery-list" id="galleryList"></div>\n    <button class="gallery-load-more" id="galleryLoadMore" type="button" hidden>Load more duels</button>\n    <button class="screen-ribbon return-left" id="galleryReturnRibbon" type="button" aria-label="Swipe left or tap to return to duel">\n      <span class="ribbon-arrow" aria-hidden="true"></span><span>Swipe left to Duel</span><span class="ribbon-handle" aria-hidden="true"></span>\n    </button>\n  </main>\n\n  <section class="gallery-viewer" id="galleryViewer" aria-hidden="true">\n    <header class="gallery-viewer-head">\n      <button class="gallery-icon-btn" id="galleryViewerClose" type="button" aria-label="Close historical duel">←</button>\n      <div class="gallery-viewer-title"><strong id="galleryViewerTitle">Historical duel</strong><span id="galleryViewerSubtitle"></span></div>\n      <button class="gallery-icon-btn" id="galleryViewerFull" type="button" aria-pressed="false" title="Toggle full-resolution images">HD</button>\n    </header>\n    <div class="gallery-viewer-scroll">\n      <div class="gallery-viewer-nav"><button id="galleryViewerPrev" type="button">← Previous</button><span id="galleryViewerPosition"></span><button id="galleryViewerNext" type="button">Next →</button></div>\n      <div class="gallery-viewer-images">\n        <article class="gallery-viewer-side" id="galleryViewerSideA"><img class="gallery-viewer-image" id="galleryViewerImageA" alt="Historical image A"><div class="gallery-viewer-side-head"><strong>Image A</strong><span id="galleryViewerStatusA"></span></div><div class="gallery-viewer-artists" id="galleryViewerArtistsA"></div></article>\n        <article class="gallery-viewer-side" id="galleryViewerSideB"><img class="gallery-viewer-image" id="galleryViewerImageB" alt="Historical image B"><div class="gallery-viewer-side-head"><strong>Image B</strong><span id="galleryViewerStatusB"></span></div><div class="gallery-viewer-artists" id="galleryViewerArtistsB"></div></article>\n      </div>\n      <div class="gallery-viewer-actions">\n        <button class="primary" id="galleryFavoriteDuel" type="button">★ Duel</button>\n        <button id="galleryFavoriteA" type="button">★ Image A</button>\n        <button id="galleryFavoriteB" type="button">★ Image B</button>\n        <button id="galleryViewerMore" type="button">More</button>\n      </div>\n      <details class="gallery-detail-card" open><summary>Details</summary><div class="gallery-detail-body" id="galleryViewerDetails"></div></details>\n      <details class="gallery-detail-card"><summary>Prompts</summary><div class="gallery-detail-body" id="galleryViewerPrompts"></div></details>\n      <details class="gallery-detail-card"><summary>Rating changes</summary><div class="gallery-detail-body" id="galleryViewerRatings"></div></details>\n    </div>\n  </section>\n\n  <main class="page app-screen generation-page" id="generationPage" hidden>\n    <header class="generation-header">\n      <div><div class="generation-title">Generation controls</div><div class="generation-subtitle">Changes apply automatically to future buffered duels.</div></div>\n      <button class="pill-btn" id="generationClose" type="button">Back to duel</button>\n    </header>\n    <button class="screen-ribbon return-right" id="generationReturnRibbon" type="button" aria-label="Swipe right or tap to return to duel">\n      <span class="ribbon-handle" aria-hidden="true"></span><span>Swipe right to Duel</span><span class="ribbon-arrow" aria-hidden="true"></span>\n    </button>\n    <section class="generation-card" id="generationCard">\n      <div class="generation-loading" id="generationLoading">Loading generation settings…</div>\n      <div id="generationForm" hidden>\n        <div class="generation-grid">\n          <div class="generation-field"><label for="genBufferTarget">Buffered duels</label><input id="genBufferTarget" type="number" min="1" max="50" step="1"></div>\n          <label class="generation-switch"><input id="genPaused" type="checkbox"><span>Pause generation after current pair</span></label>\n        </div>\n        <details class="prompt-details" open><summary>Positive prompt</summary><div class="prompt-body"><textarea id="genPositive" spellcheck="false"></textarea></div></details>\n        <details class="prompt-details"><summary>Negative prompt</summary><div class="prompt-body"><textarea id="genNegative" spellcheck="false"></textarea></div></details>\n        <section class="generation-section">\n          <div class="generation-section-title">Generation profiles</div>\n          <div class="generation-help">Both prompt boxes above are always stored. Choose what else the profile owns, then edit those settings directly below.</div>\n          <div class="mobile-profile-editor">\n            <div class="preset-row"><select id="presetSelect"><option value="">Select a generation profile</option></select><button id="loadPreset" type="button">Load</button></div>\n            <div class="preset-row"><input id="presetName" type="text" placeholder="Profile name"><button id="savePreset" type="button">Save</button></div>\n            <div class="generation-grid" style="margin-top:7px">\n              <div class="generation-field"><label for="profileOwnership">Profile controls</label><select id="profileOwnership"></select></div>\n              <div class="generation-field compact-textarea"><label for="profileNotes">Optional notes</label><textarea id="profileNotes" spellcheck="false"></textarea></div>\n            </div>\n            <div class="profile-ownership-help" id="profileOwnershipHelp"></div>\n\n            <details class="prompt-details profile-settings-details" open><summary><span>Resolution</span><span class="profile-rule-pill">Prompt + resolution / Complete</span></summary><div class="prompt-body">\n              <div class="generation-grid">\n                <div class="generation-field"><label for="genResolutionPreset">Resolution preset</label><select id="genResolutionPreset"></select></div>\n                <div class="generation-field"><label for="genWidth">Width</label><input id="genWidth" type="number" min="64" max="4096" step="64"></div>\n                <div class="generation-field"><label for="genHeight">Height</label><input id="genHeight" type="number" min="64" max="4096" step="64"></div>\n              </div>\n              <div class="generation-help">Choose Custom before entering nonstandard dimensions. Values are snapped to multiples of 64.</div>\n            </div></details>\n\n            <details class="prompt-details profile-settings-details complete"><summary><span>Complete generation configuration</span><span class="profile-rule-pill">Complete only</span></summary><div class="prompt-body">\n              <div class="generation-grid">\n                <div class="generation-field"><label for="genSteps">Steps</label><input id="genSteps" type="number" min="1" max="50" step="1"></div>\n                <div class="generation-field"><label for="genSampler">Sampler</label><select id="genSampler"></select></div>\n                <div class="generation-field"><label for="genScheduler">Noise schedule</label><select id="genScheduler"></select></div>\n                <div class="generation-field"><label for="genUcPreset">Auto-negative preset</label><select id="genUcPreset"><option value="-1">None</option><option value="0">Heavy</option><option value="1">Light</option><option value="2">Human Focus</option><option value="3">Heavy + Anatomy</option></select></div>\n                <label class="generation-switch"><input id="genQuality" type="checkbox"><span>Add quality tags</span></label>\n                <label class="generation-switch"><input id="genDecrisp" type="checkbox"><span>Decrisp mode</span></label>\n                <label class="generation-switch"><input id="genVariety" type="checkbox"><span>Variety boost</span></label>\n              </div>\n              <div class="generation-help">Unsupported sampler/schedule combinations fall back to Automatic.</div>\n            </div></details>\n\n            <div class="generation-actions"><button class="danger" id="deletePreset" type="button">Delete selected profile</button></div>\n          </div>\n        </section>\n\n        <section class="generation-section">\n          <div class="generation-section-title">Profile rotation</div>\n          <label class="generation-switch"><input id="rotationEnabled" type="checkbox"><span>Randomly rotate selected generation profiles</span></label>\n          <div class="rotation-list" id="rotationList"></div>\n        </section>\n        <div class="generation-status" id="generationStatus"></div>\n      </div>\n    </section>\n    <button class="screen-ribbon return-right" id="generationReturnRibbonBottom" type="button" aria-label="Swipe right or tap to return to duel">\n      <span class="ribbon-handle" aria-hidden="true"></span><span>Swipe right to Duel</span><span class="ribbon-arrow" aria-hidden="true"></span>\n    </button>\n  </main>\n\n  <div class="sheet-backdrop" id="sheetBackdrop" aria-hidden="true">\n    <section class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">\n      <div class="sheet-head"><div class="sheet-title" id="sheetTitle">Menu</div><button class="sheet-close" id="sheetClose" type="button">✕</button></div>\n      <div id="sheetBody"></div>\n    </section>\n  </div>\n  <div class="status-toast" id="statusToast"></div>\n\n<script>\n(() => {\n  const $ = (id) => document.getElementById(id);\n  const refs = {\n    duelShell:$(\'duelShell\'), cardA:$(\'cardA\'), cardB:$(\'cardB\'), stageA:$(\'stageA\'), stageB:$(\'stageB\'), imgA:$(\'imgA\'), imgB:$(\'imgB\'), overlayA:$(\'overlayA\'), overlayB:$(\'overlayB\'),\n    artistStripA:$(\'artistStripA\'), artistStripB:$(\'artistStripB\'), artistsA:$(\'artistsA\'), artistsB:$(\'artistsB\'),\n    gestureZone:$(\'gestureZone\'), toolsButton:$(\'toolsButton\'), sheetBackdrop:$(\'sheetBackdrop\'), sheetBody:$(\'sheetBody\'), sheetTitle:$(\'sheetTitle\'), sheetClose:$(\'sheetClose\'),\n    statusToast:$(\'statusToast\'), resultCard:$(\'resultCard\'), resultTitle:$(\'resultTitle\'), resultSubtitle:$(\'resultSubtitle\'), chanceRow:$(\'chanceRow\'), chanceA:$(\'chanceA\'), chanceB:$(\'chanceB\'), resultSides:$(\'resultSides\'), resultFoot:$(\'resultFoot\'),\n    sessionStrip:document.querySelector(\'.session-strip\'), sessionTime:$(\'sessionTime\'), sessionDuels:$(\'sessionDuels\'), sessionPace:$(\'sessionPace\'), etaLabel:$(\'etaLabel\'), etaText:$(\'etaText\'), duelTypeChip:$(\'duelTypeChip\'), duelTypeText:$(\'duelTypeText\'),\n    bufferReady:$(\'bufferReady\'), bufferQueued:$(\'bufferQueued\'), bufferRefill:$(\'bufferRefill\'), bufferTarget:$(\'bufferTarget\'), bufferRefillChip:$(\'bufferRefillChip\'), emptyDuel:$(\'emptyDuel\'), emptyDuelIcon:$(\'emptyDuelIcon\'), emptyDuelTitle:$(\'emptyDuelTitle\'), emptyDuelMessage:$(\'emptyDuelMessage\'), emptyRefreshBtn:$(\'emptyRefreshBtn\'),\n    installBtn:$(\'installBtn\'), coverageSummary:$(\'coverageSummary\'), coverageDiscovery:$(\'coverageDiscovery\'), coverageFollowup:$(\'coverageFollowup\'), coverageSeen:$(\'coverageSeen\'), coverageUnseen:$(\'coverageUnseen\'), coverageOneMatch:$(\'coverageOneMatch\'), coverageTwoPlus:$(\'coverageTwoPlus\'), coverageMode:$(\'coverageMode\'), coverageRate:$(\'coverageRate\'), coverageEtas:$(\'coverageEtas\'), coverageNote:$(\'coverageNote\'),\n    duelPage:$(\'duelPage\'), artistLadderPage:$(\'artistLadderPage\'), artistLadderClose:$(\'artistLadderClose\'), artistLadderReturnRibbon:$(\'artistLadderReturnRibbon\'), artistLadderSearch:$(\'artistLadderSearch\'), artistLadderRefresh:$(\'artistLadderRefresh\'), artistLadderSort:$(\'artistLadderSort\'), artistLadderStage:$(\'artistLadderStage\'), artistLadderFavorites:$(\'artistLadderFavorites\'), artistLadderSummary:$(\'artistLadderSummary\'), artistLadderPosition:$(\'artistLadderPosition\'), artistLadderList:$(\'artistLadderList\'), artistLadderLoadMore:$(\'artistLadderLoadMore\'), galleryPage:$(\'galleryPage\'), galleryArtistRibbon:$(\'galleryArtistRibbon\'), navigationRibbon:$(\'navigationRibbon\'), galleryReturnRibbon:$(\'galleryReturnRibbon\'), galleryClose:$(\'galleryClose\'), gallerySearch:$(\'gallerySearch\'), galleryFilterButton:$(\'galleryFilterButton\'), galleryRefresh:$(\'galleryRefresh\'), galleryQuickSolo:$(\'galleryQuickSolo\'), galleryQuickDuo:$(\'galleryQuickDuo\'), galleryQuickTrio:$(\'galleryQuickTrio\'), galleryQuickFavorites:$(\'galleryQuickFavorites\'), galleryQuickBothBad:$(\'galleryQuickBothBad\'), galleryQuickMissing:$(\'galleryQuickMissing\'), gallerySummary:$(\'gallerySummary\'), galleryActiveFilterCount:$(\'galleryActiveFilterCount\'), galleryList:$(\'galleryList\'), galleryLoadMore:$(\'galleryLoadMore\'), galleryViewer:$(\'galleryViewer\'), galleryViewerClose:$(\'galleryViewerClose\'), galleryViewerTitle:$(\'galleryViewerTitle\'), galleryViewerSubtitle:$(\'galleryViewerSubtitle\'), galleryViewerFull:$(\'galleryViewerFull\'), galleryViewerPrev:$(\'galleryViewerPrev\'), galleryViewerNext:$(\'galleryViewerNext\'), galleryViewerPosition:$(\'galleryViewerPosition\'), galleryViewerSideA:$(\'galleryViewerSideA\'), galleryViewerSideB:$(\'galleryViewerSideB\'), galleryViewerImageA:$(\'galleryViewerImageA\'), galleryViewerImageB:$(\'galleryViewerImageB\'), galleryViewerStatusA:$(\'galleryViewerStatusA\'), galleryViewerStatusB:$(\'galleryViewerStatusB\'), galleryViewerArtistsA:$(\'galleryViewerArtistsA\'), galleryViewerArtistsB:$(\'galleryViewerArtistsB\'), galleryFavoriteDuel:$(\'galleryFavoriteDuel\'), galleryFavoriteA:$(\'galleryFavoriteA\'), galleryFavoriteB:$(\'galleryFavoriteB\'), galleryViewerMore:$(\'galleryViewerMore\'), galleryViewerDetails:$(\'galleryViewerDetails\'), galleryViewerPrompts:$(\'galleryViewerPrompts\'), galleryViewerRatings:$(\'galleryViewerRatings\'), generationPage:$(\'generationPage\'), generationReturnRibbon:$(\'generationReturnRibbon\'), generationReturnRibbonBottom:$(\'generationReturnRibbonBottom\'), generationClose:$(\'generationClose\'), generationLoading:$(\'generationLoading\'), generationForm:$(\'generationForm\'), genBufferTarget:$(\'genBufferTarget\'), genUcPreset:$(\'genUcPreset\'), genQuality:$(\'genQuality\'), genPaused:$(\'genPaused\'), genPositive:$(\'genPositive\'), genNegative:$(\'genNegative\'), genResolutionPreset:$(\'genResolutionPreset\'), genWidth:$(\'genWidth\'), genHeight:$(\'genHeight\'), genSteps:$(\'genSteps\'), genSampler:$(\'genSampler\'), genScheduler:$(\'genScheduler\'), genDecrisp:$(\'genDecrisp\'), genVariety:$(\'genVariety\'), presetSelect:$(\'presetSelect\'), presetName:$(\'presetName\'), profileOwnership:$(\'profileOwnership\'), profileOwnershipHelp:$(\'profileOwnershipHelp\'), profileNotes:$(\'profileNotes\'), loadPreset:$(\'loadPreset\'), savePreset:$(\'savePreset\'), deletePreset:$(\'deletePreset\'), rotationEnabled:$(\'rotationEnabled\'), rotationList:$(\'rotationList\'), generationStatus:$(\'generationStatus\')\n  };\n  const state = {\n    duel:null, queue:[], busy:false, gesture:null, suppressClickUntil:0, longPress:null,\n    settings:loadSettings(), session:loadSession(), lastPayload:null, toastTimer:null,\n    feedbackTimer:null, emptyPollInFlight:false, lastReady:false, visualMode:\'\', generation:null, generationLoaded:false, activeScreen:\'duel\', screenScroll:{duel:0,gallery:0,artists:0,generation:0}, artists:{items:[],total:0,offset:0,limit:30,loading:false,loaded:false,hasMore:false,filters:{q:\'\',sort:\'top\',stage:\'\',favorites:false}}, gallery:{items:[],total:0,offset:0,limit:18,loading:false,loaded:false,hasMore:false,detail:null,full:false,filters:{q:\'\',artist:\'\',exact:false,preset:\'\',favorite:false,lost:false,outcome:\'all\',images:\'all\',sizes:[]}},\n  };\n\n  function escapeHtml(value) { return String(value ?? \'\').replace(/[&<>\'"]/g, ch => ({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',"\'":\'&#39;\',\'"\':\'&quot;\'}[ch])); }\n  function loadSettings(){const defaults={blind:true,reveal:false,showSessionStats:true,showDuelType:true};try{return {...defaults,...JSON.parse(localStorage.getItem(\'artistEloDuelPageSettings\')||\'{}\')}}catch{return defaults}}\n  function saveSettings(){try{localStorage.setItem(\'artistEloDuelPageSettings\',JSON.stringify(state.settings))}catch{}}\n  function applyDisplaySettings(){refs.sessionStrip.hidden=state.settings.showSessionStats===false;const reason=state.duel?.matchmaking_reason||\'\';refs.duelTypeText.textContent=reason||\'Unknown\';refs.duelTypeChip.hidden=state.settings.showDuelType===false||!state.duel;refs.resultFoot.hidden=state.settings.showDuelType===false}\n  function loadSession(){ try{return {...{activeMs:0,lastAt:0,count:0,a:0,b:0},...JSON.parse(localStorage.getItem(\'artistEloDuelPageSession\')||\'{}\')}}catch{return{activeMs:0,lastAt:0,count:0,a:0,b:0}} }\n  function saveSession(){try{localStorage.setItem(\'artistEloDuelPageSession\',JSON.stringify(state.session))}catch{}}\n  const soundPatterns={\n    choose:[{frequency:620,duration:.075,gain:.42,type:\'sine\'},{frequency:930,duration:.065,delay:.027,gain:.28,type:\'sine\'}],\n    queue:[{frequency:660,duration:.145,gain:.40,type:\'sine\'},{frequency:880,duration:.195,delay:.11,gain:.42,type:\'sine\'}],\n    bad:[{frequency:150,endFrequency:82,duration:.19,gain:.42,type:\'sawtooth\'},{frequency:95,duration:.16,delay:.038,gain:.22,type:\'square\'}],\n    tie:[{frequency:410,duration:.115,gain:.34,type:\'triangle\'},{frequency:415,duration:.09,delay:.072,gain:.22,type:\'triangle\'}],\n  };\n  let soundContext=null,soundMaster=null;\n  function soundsEnabled(){try{return localStorage.getItem(\'artistElo.soundsEnabled\')!==\'false\'}catch{return true}}\n  function soundVolume(){try{const value=Number(localStorage.getItem(\'artistElo.soundVolume\')??\'.32\');return Number.isFinite(value)?Math.max(0,Math.min(1,value)):.32}catch{return .32}}\n  function setSoundEnabled(value){try{localStorage.setItem(\'artistElo.soundsEnabled\',value?\'true\':\'false\')}catch{};try{window.ArtistRankerNative?.setSoundEnabled(Boolean(value))}catch{}}\n  function setSoundVolume(value){try{localStorage.setItem(\'artistElo.soundVolume\',String(Math.max(0,Math.min(1,Number(value)||0))))}catch{};if(soundMaster&&soundContext){try{soundMaster.gain.setValueAtTime(soundVolume(),soundContext.currentTime)}catch{soundMaster.gain.value=soundVolume()}}}\n  function ensureSound(){const Ctor=window.AudioContext||window.webkitAudioContext;if(!Ctor||!soundsEnabled())return null;if(!soundContext||soundContext.state===\'closed\'){try{soundContext=new Ctor({latencyHint:\'interactive\'});soundMaster=soundContext.createGain();soundMaster.gain.value=soundVolume();soundMaster.connect(soundContext.destination)}catch{return null}}if(soundContext.state!==\'running\')soundContext.resume?.().catch(()=>{});return soundContext}\n  function synthTone(ctx,tone){if(!ctx||!soundMaster)return;const duration=Math.max(.025,Number(tone.duration)||.08),start=ctx.currentTime+Math.max(0,Number(tone.delay)||0),osc=ctx.createOscillator(),gain=ctx.createGain();osc.type=tone.type||\'sine\';osc.frequency.setValueAtTime(Math.max(20,Number(tone.frequency)||440),start);if(tone.endFrequency)osc.frequency.exponentialRampToValueAtTime(Math.max(20,Number(tone.endFrequency)),start+duration);gain.gain.setValueAtTime(.0001,start);gain.gain.exponentialRampToValueAtTime(Math.max(.0001,Number(tone.gain)||.25),start+Math.min(.008,duration/3));gain.gain.exponentialRampToValueAtTime(.0001,start+duration);osc.connect(gain).connect(soundMaster);osc.start(start);osc.stop(start+duration+.035)}\n  window.addEventListener(\'artist-ranker-native-settings\',event=>{if(typeof event.detail?.soundEnabled===\'boolean\')setSoundEnabled(event.detail.soundEnabled)});\n  function playSound(kind){if(!soundsEnabled()||soundVolume()<=0||!soundPatterns[kind])return;const ctx=ensureSound();const play=()=>{if(ctx?.state===\'running\'){soundMaster.gain.setValueAtTime(soundVolume(),ctx.currentTime);soundPatterns[kind].forEach(tone=>synthTone(ctx,tone))}};play();if(ctx?.state!==\'running\')window.setTimeout(play,45)}\n  function pad(n){return String(n).padStart(2,\'0\')}\n  function duration(ms){const s=Math.max(0,Math.floor(ms/1000)),h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h?`${h}:${pad(m)}:${pad(s%60)}`:`${pad(m)}:${pad(s%60)}`}\n  function markActive(){const now=Date.now();if(state.session.lastAt&&now-state.session.lastAt<=300000)state.session.activeMs+=now-state.session.lastAt;state.session.lastAt=now;saveSession();}\n  function compactHours(hours){if(!Number.isFinite(hours)||hours<=0)return\'\';if(hours<1)return`~${Math.max(1,Math.round(hours*60))}m active`;if(hours<10)return`~${hours.toFixed(1)}h active`;return`~${Math.round(hours)}h active`;}\n  function updateSession(){\n    const active=state.session.activeMs;\n    refs.sessionTime.textContent=duration(active);\n    refs.sessionDuels.textContent=String(state.session.count||0);\n    const hours=active/3600000;\n    const pace=hours>.02?state.session.count/hours:0;\n    refs.sessionPace.textContent=pace>0?`${pace.toFixed(1)} / hr`:\'0 / hr\';\n    const coverage=state.lastPayload?.coverage||{};\n    const eta=coverage.active_eta_duels;\n    const target=coverage.active_target_label||\'\';\n    refs.etaLabel.textContent=coverage.active_goal_label||\'Next evidence goal\';\n    if(coverage.configured_complete){\n      refs.etaText.textContent=\'5+ evidence goal complete\';\n    }else if(Number.isFinite(Number(eta))){\n      const duels=Number(eta);\n      const time=pace>0.1?compactHours(duels/pace):\'\';\n      refs.etaText.textContent=`${duels.toLocaleString()} duels${time?\' · \'+time:\'\'}${target?\' to \'+target:\'\'}`;\n    }else{\n      refs.etaText.textContent=\'Gathering recent progress rate\';\n    }\n  }\n  setInterval(()=>{const now=Date.now();if(state.session.lastAt&&now-state.session.lastAt<=300000){state.session.activeMs+=now-state.session.lastAt;state.session.lastAt=now;saveSession()}updateSession()},1000);\n\n  function toast(message){clearTimeout(state.toastTimer);refs.statusToast.textContent=message;refs.statusToast.classList.add(\'show\');state.toastTimer=setTimeout(()=>refs.statusToast.classList.remove(\'show\'),1800);}\n  function setBusy(value){state.busy=!!value;document.querySelectorAll(\'.vote-controls button,#undoBtn,#refreshBtn,#emptyRefreshBtn\').forEach(b=>b.disabled=state.busy);refs.toolsButton.disabled=false;refs.sheetClose.disabled=false;}\n  function openSheet(title, html){refs.sheetTitle.textContent=title;refs.sheetBody.innerHTML=html;refs.sheetBackdrop.classList.add(\'open\');refs.sheetBackdrop.setAttribute(\'aria-hidden\',\'false\');wireSheetActions();}\n  function closeSheet(){refs.sheetBackdrop.classList.remove(\'open\');refs.sheetBackdrop.setAttribute(\'aria-hidden\',\'true\');refs.sheetBody.innerHTML=\'\';}\n  refs.sheetClose.addEventListener(\'click\',closeSheet);refs.sheetBackdrop.addEventListener(\'click\',e=>{if(e.target===refs.sheetBackdrop)closeSheet()});\n\n  function preload(duel){if(!duel)return;[duel.image_a_url,duel.image_b_url].forEach(src=>{if(!src)return;const img=new Image();img.decoding=\'async\';img.src=src;});}\n  const feedbackClasses=[\'gesture-winner\',\'gesture-loser\',\'gesture-tie\',\'gesture-bad\',\'commit-win\',\'commit-lose\',\'commit-tie\',\'commit-bad\'];\n  function resetCard(card,overlay){card.style.setProperty(\'--scale\',\'1\');card.style.setProperty(\'--dim\',\'0\');feedbackClasses.forEach(name=>card.classList.remove(name));const stage=card.querySelector(\'.image-stage\');stage.style.setProperty(\'--winner-ring\',\'0px\');stage.style.setProperty(\'--loser-ring\',\'0px\');stage.style.setProperty(\'--winner-color\',\'transparent\');stage.style.setProperty(\'--loser-color\',\'transparent\');overlay.dataset.choice=\'\';overlay.style.setProperty(\'--choice-opacity\',\'0\');overlay.style.setProperty(\'--choice-scale\',\'.72\')}\n  function clearGesture(){resetCard(refs.cardA,refs.overlayA);resetCard(refs.cardB,refs.overlayB);refs.duelShell.classList.remove(\'feedback-a\',\'feedback-b\',\'feedback-tie\',\'feedback-bad\');state.visualMode=\'\'}\n  function beginVisualMode(mode){if(state.visualMode===mode)return;clearGesture();state.visualMode=mode}\n  function setGestureOverlay(card,overlay,className,choice,progress){card.classList.add(className);overlay.dataset.choice=choice;overlay.style.setProperty(\'--choice-opacity\',String(Math.max(0,Math.min(1,(progress-.12)/.7))));overlay.style.setProperty(\'--choice-scale\',String(.72+Math.max(0,Math.min(1,progress))*.28))}\n  function applySwipe(direction,progress){beginVisualMode(`swipe-${direction}`);progress=Math.max(0,Math.min(1,progress));const winner=direction===\'A\'?refs.cardA:refs.cardB,loser=direction===\'A\'?refs.cardB:refs.cardA,wOverlay=direction===\'A\'?refs.overlayA:refs.overlayB,lOverlay=direction===\'A\'?refs.overlayB:refs.overlayA,wStage=winner.querySelector(\'.image-stage\'),lStage=loser.querySelector(\'.image-stage\');winner.style.setProperty(\'--scale\',String(1+progress*.04));loser.style.setProperty(\'--scale\',String(1-progress*.024));loser.style.setProperty(\'--dim\',String(progress));setGestureOverlay(winner,wOverlay,\'gesture-winner\',\'win\',progress);setGestureOverlay(loser,lOverlay,\'gesture-loser\',\'lose\',progress);wStage.style.setProperty(\'--winner-ring\',`${2+progress*9}px`);wStage.style.setProperty(\'--winner-color\',\'var(--green-soft)\');lStage.style.setProperty(\'--loser-ring\',`${1+progress*5}px`);lStage.style.setProperty(\'--loser-color\',\'var(--red-soft)\')}\n  function applyMultiGesture(action,progress){beginVisualMode(`multi-${action}`);progress=Math.max(0,Math.min(1,progress));const tie=action===\'TIE\',bad=action===\'BOTH_BAD\',undo=action===\'UNDO\',className=tie?\'gesture-tie\':bad?\'gesture-bad\':\'gesture-tie\',choice=tie?\'tie\':bad?\'bad\':\'undo\',color=tie?\'var(--amber-soft)\':bad?\'var(--red-soft)\':\'var(--blue-soft)\';[[refs.cardA,refs.overlayA],[refs.cardB,refs.overlayB]].forEach(([card,overlay])=>{card.classList.add(className);setGestureOverlay(card,overlay,className,choice,progress);const stage=card.querySelector(\'.image-stage\');stage.style.setProperty(\'--winner-ring\',`${2+progress*8}px`);stage.style.setProperty(\'--winner-color\',color);card.style.setProperty(\'--scale\',String(1+progress*.012))})}\n  function nativeBothBadHaptic(){try{window.ArtistRankerNative?.haptic(\'both_bad\')}catch{}}\n  function commitFeedback(action){clearTimeout(state.feedbackTimer);clearGesture();let sound=\'\';if(action===\'A\'||action===\'B\'){const winner=action===\'A\'?refs.cardA:refs.cardB,loser=action===\'A\'?refs.cardB:refs.cardA,wOverlay=action===\'A\'?refs.overlayA:refs.overlayB,lOverlay=action===\'A\'?refs.overlayB:refs.overlayA;winner.classList.add(\'commit-win\');loser.classList.add(\'commit-lose\');wOverlay.dataset.choice=\'win\';lOverlay.dataset.choice=\'lose\';refs.duelShell.classList.add(action===\'A\'?\'feedback-a\':\'feedback-b\');sound=\'choose\'}else if(action===\'TIE\'){[refs.cardA,refs.cardB].forEach(card=>card.classList.add(\'commit-tie\'));refs.overlayA.dataset.choice=refs.overlayB.dataset.choice=\'tie\';refs.duelShell.classList.add(\'feedback-tie\');sound=\'tie\'}else if(action===\'BOTH_BAD\'){[refs.cardA,refs.cardB].forEach(card=>card.classList.add(\'commit-bad\'));refs.overlayA.dataset.choice=refs.overlayB.dataset.choice=\'bad\';refs.duelShell.classList.add(\'feedback-bad\');sound=\'bad\';nativeBothBadHaptic()}if(sound)playSound(sound);return new Promise(resolve=>{state.feedbackTimer=setTimeout(()=>{clearGesture();resolve()},405)})}\n\n  function artistButtons(container,artists){\n    container.innerHTML=\'\';\n    (artists||[]).forEach(artist=>{\n      const b=document.createElement(\'button\');\n      b.type=\'button\';\n      b.className=\'artist-chip\';\n      b.textContent=artist;\n      b.dataset.artist=artist;\n      b.title=`Open actions for ${artist}`;\n      b.setAttribute(\'aria-label\',`Open actions for artist ${artist}`);\n      b.setAttribute(\'aria-haspopup\',\'dialog\');\n      container.appendChild(b);\n    });\n  }\n  function renderArtists(){\n    const hidden=state.settings.blind;\n    refs.artistStripA.hidden=hidden;\n    refs.artistStripB.hidden=hidden;\n    if(!hidden&&state.duel){\n      artistButtons(refs.artistsA,state.duel.artists_a);\n      artistButtons(refs.artistsB,state.duel.artists_b);\n    }\n  }\n\n  function deltaClass(value){const v=Number(value||0);return v>.001?\'delta-positive\':v<-.001?\'delta-negative\':\'delta-neutral\'}\n  function renderResult(result){if(!result){refs.resultCard.classList.add(\'empty\');return}refs.resultCard.classList.remove(\'empty\');refs.resultTitle.textContent=result.title||\'Duel updated\';refs.resultSubtitle.textContent=result.subtitle||\'\';if(result.expected_a_pct!=null){refs.chanceRow.hidden=false;refs.chanceA.textContent=`${Number(result.expected_a_pct).toFixed(1)}%`;refs.chanceB.textContent=`${Number(result.expected_b_pct).toFixed(1)}%`}else refs.chanceRow.hidden=true;refs.resultSides.innerHTML=\'\';for(const side of result.sides||[]){const box=document.createElement(\'div\');box.className=\'result-side\';box.innerHTML=`<div class="result-side-head"><span>Side ${escapeHtml(side.side)}</span><span>${escapeHtml(side.label||\'\')}</span></div>`;for(const artist of side.artists||[]){const row=document.createElement(\'div\');row.className=\'result-artist\';const delta=Number(artist.skill_delta||0);row.innerHTML=`<button type="button" class="artist-chip" data-artist="${escapeHtml(artist.name)}">${escapeHtml(artist.name)}</button><span class="${deltaClass(delta)}">μ ${Number(artist.mu||0).toFixed(1)} (${delta>=0?\'+\':\'\'}${delta.toFixed(1)})</span>`;box.appendChild(row)}refs.resultSides.appendChild(box)}refs.resultFoot.textContent=state.settings.showDuelType===false?\'\':(result.duel_type||\'\');refs.resultFoot.hidden=state.settings.showDuelType===false;}\n\n  function renderBuffer(buffer){buffer=buffer||{};const ready=Number(buffer.total_ready||0),target=Number(buffer.target||0);refs.bufferReady.textContent=`${ready} / ${target}`;refs.bufferQueued.textContent=String(Number(buffer.queued||0));refs.bufferTarget.textContent=String(target);const paused=!!buffer.paused,refill=!!buffer.refill;refs.bufferRefill.textContent=paused?\'Paused\':refill?\'Refilling\':\'Idle\';refs.bufferRefillChip.classList.toggle(\'paused\',paused);refs.bufferRefillChip.classList.toggle(\'refilling\',!paused&&refill);try{window.ArtistRankerNative?.bufferState(ready,target)}catch{}}\n  function etaText(value,pace){if(!Number.isFinite(Number(value)))return\'—\';const duels=Number(value);if(duels<=0)return\'Reached\';const hours=pace>0.1?compactHours(duels/pace):\'\';return`${duels.toLocaleString()} duels${hours?\' · \'+hours:\'\'}`;}\n  function renderCoverage(coverage){\n    coverage=coverage||{};\n    const discovery=Number(coverage.discovery_fraction||coverage.fraction||0)*100;\n    const followup=Number(coverage.followup_fraction||0)*100;\n    refs.coverageSummary.textContent=`${discovery.toFixed(1)}% seen · ${followup.toFixed(1)}% at 2+`;\n    refs.coverageDiscovery.textContent=`${discovery.toFixed(1)}%`;\n    refs.coverageFollowup.textContent=`${followup.toFixed(1)}%`;\n    refs.coverageSeen.textContent=`${Number(coverage.seen||0).toLocaleString()} / ${Number(coverage.total||0).toLocaleString()}`;\n    refs.coverageUnseen.textContent=Number(coverage.unseen||0).toLocaleString();\n    refs.coverageOneMatch.textContent=Number(coverage.one_match||0).toLocaleString();\n    refs.coverageTwoPlus.textContent=Number(coverage.two_plus||0).toLocaleString();\n    refs.coverageMode.textContent=coverage.mode_label||coverage.mode||\'—\';\n    const recent=coverage.recent||{};\n    refs.coverageRate.textContent=Number(recent.window_duels||0)>0?`${Number(recent.active_per_100||0).toFixed(1)} artists reach ${Number(coverage.active_threshold||1)}+ / 100 duels`:\'Gathering history\';\n    const activeEtas=coverage.active_etas||{};\n    const stageName=coverage.active_goal_label||\'evidence coverage\';\n    const active=state.session.activeMs/3600000;\n    const pace=active>.02?state.session.count/active:0;\n    refs.coverageEtas.innerHTML=\'\';\n    for(const target of [\'80\',\'90\',\'95\',\'99\',\'100\']){\n      const box=document.createElement(\'div\');box.className=\'coverage-eta\';\n      box.innerHTML=`<div class="target">${target}% ${stageName}</div><div class="duels">${etaText(activeEtas[target],pace)}</div>`;\n      refs.coverageEtas.appendChild(box);\n    }\n    const threshold=Number(coverage.active_threshold||1);\n    const crossings=Number(recent.active_crossings||0);\n    if(coverage.configured_complete)refs.coverageNote.textContent=\'Every artist has reached the configured 5+ evidence goal.\';\n    else refs.coverageNote.textContent=`Currently estimating ${coverage.active_goal_label||stageName}. ${crossings.toLocaleString()} artists crossed the ${threshold}+ threshold in the most recent ${Number(recent.window_duels||0).toLocaleString()} completed duels.`;\n  }\n\n  function setEmptyState(buffer){buffer=buffer||{};refs.duelShell.classList.add(\'empty-mode\');refs.duelShell.classList.toggle(\'empty-error\',!!buffer.error);refs.duelShell.classList.toggle(\'empty-paused\',!!buffer.paused);refs.imgA.removeAttribute(\'src\');refs.imgB.removeAttribute(\'src\');refs.artistsA.innerHTML=\'\';refs.artistsB.innerHTML=\'\';refs.artistStripA.hidden=true;refs.artistStripB.hidden=true;clearGesture();if(buffer.error){refs.emptyDuelIcon.textContent=\'!\';refs.emptyDuelTitle.textContent=\'The next duel could not be generated\';refs.emptyDuelMessage.textContent=String(buffer.error)}else if(buffer.paused){refs.emptyDuelIcon.textContent=\'Ⅱ\';refs.emptyDuelTitle.textContent=\'Generation is paused\';refs.emptyDuelMessage.textContent=\'Resume generation in the full ranker, then this page will load the next duel automatically.\'}else{refs.emptyDuelIcon.textContent=\'◌\';refs.emptyDuelTitle.textContent=\'Generating the next duel\';refs.emptyDuelMessage.textContent=\'The buffer is empty. This screen will update automatically as soon as the next comparison is ready.\'}}\n  function clearEmptyState(){refs.duelShell.classList.remove(\'empty-mode\',\'empty-error\',\'empty-paused\')}\n  function render(payload){const hadDuel=!!state.duel;state.lastPayload=payload;state.duel=payload.current||null;state.queue=payload.queue||[];renderBuffer(payload.buffer);renderCoverage(payload.coverage);renderResult(payload.last_result||null);applyDisplaySettings();if(!state.duel){state.lastReady=false;setEmptyState(payload.buffer);updateSession();return}clearEmptyState();refs.imgA.src=state.duel.image_a_url;refs.imgB.src=state.duel.image_b_url;renderArtists();preload(state.duel);state.queue.slice(0,4).forEach(preload);clearGesture();if(!hadDuel&&state.lastReady)playSound(\'queue\');state.lastReady=true;updateSession()}\n  async function fetchState(){if(state.emptyPollInFlight)return;state.emptyPollInFlight=true;try{const r=await fetch(\'/api/duel/state\',{cache:\'no-store\'});if(!r.ok)throw new Error(`HTTP ${r.status}`);render(await r.json())}finally{state.emptyPollInFlight=false}}\n  async function fetchMetrics(){try{const r=await fetch(\'/api/duel/metrics\',{cache:\'no-store\'});if(!r.ok)throw new Error(`HTTP ${r.status}`);const payload=await r.json();state.lastPayload={...(state.lastPayload||{}),coverage:payload.coverage,buffer:payload.buffer};renderBuffer(payload.buffer);renderCoverage(payload.coverage);updateSession();}catch(err){refs.coverageSummary.textContent=\'Metrics unavailable\';refs.coverageNote.textContent=`Could not refresh coverage metrics: ${err.message||err}`;}}\n\n  async function submitAction(action){if(state.busy)return;if(!state.duel&&action!==\'UNDO\')return;setBusy(true);markActive();const before=state.duel;const voted=[\'A\',\'B\',\'TIE\',\'BOTH_BAD\'].includes(action);if(voted){state.session.count++;if(action===\'A\')state.session.a++;if(action===\'B\')state.session.b++;saveSession()}const request=fetch(\'/api/duel/action\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({action,duel_id:before?.duel_id||\'\'})});try{if(voted)await commitFeedback(action);if([\'A\',\'B\',\'TIE\',\'BOTH_BAD\',\'SKIP\'].includes(action)){const optimistic={...(state.lastPayload||{}),current:state.queue[0]||null,queue:state.queue.slice(1),last_result:state.lastPayload?.last_result||null,buffer:{...(state.lastPayload?.buffer||{}),total_ready:Math.max(0,Number(state.lastPayload?.buffer?.total_ready||1)-1),queued:Math.max(0,Number(state.lastPayload?.buffer?.queued||0)-1),refill:true}};render(optimistic)}const r=await request;let body={};try{body=await r.json()}catch{}if(!r.ok||!body.ok)throw new Error(body.detail||body.error||`HTTP ${r.status}`);render(body.state)}catch(err){toast(`Action failed: ${err.message||err}`);await fetchState()}finally{setBusy(false)}}\n\n  function toolMenuHtml(){return `<div class="sheet-section"><div class="sheet-section-title">Voting</div><div class="sheet-grid"><button data-action="UNDO">Undo</button><button data-action="SKIP">Skip</button><button data-action="TIE">Tie</button><button data-action="BOTH_BAD" class="danger">Both bad</button><button data-favorite="Duel — both images" class="wide">Favorite current duel</button></div></div><div class="sheet-section"><div class="sheet-section-title">Display and sound</div><label class="checkline"><input id="sheetBlind" type="checkbox" ${state.settings.blind?\'checked\':\'\'}><span>Hide artist names before voting</span></label><label class="checkline"><input id="sheetReveal" type="checkbox" ${state.settings.reveal?\'checked\':\'\'}><span>Briefly reveal names after a vote</span></label><label class="checkline"><input id="sheetSessionStats" type="checkbox" ${state.settings.showSessionStats!==false?\'checked\':\'\'}><span>Show session stats</span></label><label class="checkline"><input id="sheetDuelType" type="checkbox" ${state.settings.showDuelType!==false?\'checked\':\'\'}><span>Show duel type</span></label><label class="checkline"><input id="sheetSounds" type="checkbox" ${soundsEnabled()?\'checked\':\'\'}><span>Sound effects</span></label><label>Sound volume</label><input id="sheetSoundVolume" type="range" min="0" max="1" step="0.05" value="${soundVolume()}"></div><div class="sheet-section"><div class="sheet-section-title">Navigation</div><div class="sheet-grid"><button data-open-generation="true" class="wide">Generation controls</button><a href="/ranker/" class="wide">Open full ranker</a></div></div><div class="sheet-message" id="sheetMessage"></div>`}\n  function sideMenuHtml(side){const duel=state.duel,artists=side===\'A\'?duel?.artists_a:duel?.artists_b;return `<div class="sheet-section"><div class="sheet-section-title">Artists on side ${side}</div><div class="artist-menu-list">${(artists||[]).map(a=>`<button data-open-artist="${escapeHtml(a)}">${escapeHtml(a)}</button>`).join(\'\')}</div></div><div class="sheet-section"><div class="sheet-section-title">Image and duel</div><div class="sheet-grid"><button data-favorite="Image ${side}">Favorite image ${side}</button><button data-favorite="Combination ${side}">Favorite combination</button><button data-favorite="Duel — both images">Favorite duel</button><button data-bad="${side}" class="danger">Report bad image</button></div></div><div class="sheet-message" id="sheetMessage"></div>`}\n  function searchUrl(site,artist){const tag=encodeURIComponent(String(artist).replace(/ /g,\'_\'));if(site===\'gelbooru\')return `https://gelbooru.com/index.php?page=post&s=list&tags=${tag}`;if(site===\'rule34\')return `https://rule34.xxx/index.php?page=post&s=list&tags=${tag}`;return `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(artist)}`}\n  async function getArtistState(artist){const r=await fetch(`/api/duel/artist/state?artist=${encodeURIComponent(artist)}`,{cache:\'no-store\'});let body={};try{body=await r.json()}catch{}if(!r.ok)throw new Error(body.detail||body.error||`HTTP ${r.status}`);return body}\n  function styleTagHtml(artist,info){\n    const selected=new Set(info.manual_tags||[]);\n    const options=info.manual_tag_options||[];\n    if(!options.length)return \'<div class="sheet-message">No manual classification tags are configured.</div>\';\n    return `<p class="style-tag-help">Tap a category to apply or remove it immediately. These are the same manual tags used by Artists, Gallery, and Boolean search.</p><div class="style-tag-grid">${options.map(option=>{const active=selected.has(option.id);return `<button type="button" class="style-tag-toggle" data-artist-style="${escapeHtml(artist)}" data-style-id="${escapeHtml(option.id)}" aria-pressed="${active?\'true\':\'false\'}"><span aria-hidden="true">${escapeHtml(option.icon||\'🏷\')}</span><span>${escapeHtml(option.label||option.id)}</span><span class="style-check" aria-hidden="true">✓</span></button>`}).join(\'\')}</div>`;\n  }\n  function markArtistChips(artist,tagIds){\n    const hasTags=Array.isArray(tagIds)&&tagIds.length>0;\n    document.querySelectorAll(\'.artist-chip[data-artist]\').forEach(button=>{\n      if(button.dataset.artist===artist)button.classList.toggle(\'has-manual-tags\',hasTags);\n    });\n  }\n  function applyArtistFavoriteState(artist,info){\n    const favorite=Boolean(info?.is_favorite);\n    const toggle=refs.sheetBody.querySelector(`[data-artist-toggle="${CSS.escape(String(artist||\'\'))}"]`);\n    if(toggle){toggle.textContent=favorite?\'★ Favorited\':\'☆ Favorite artist\';toggle.classList.toggle(\'success\',favorite);toggle.setAttribute(\'aria-pressed\',favorite?\'true\':\'false\')}\n    const tags=$(\'artistFavTags\'),note=$(\'artistFavNote\');\n    if(tags&&Object.prototype.hasOwnProperty.call(info||{},\'favorite_tags\'))tags.value=info.favorite_tags||\'\';\n    if(note&&Object.prototype.hasOwnProperty.call(info||{},\'favorite_note\'))note.value=info.favorite_note||\'\';\n    document.querySelectorAll(`.artist-chip[data-artist="${CSS.escape(String(artist||\'\'))}"]`).forEach(chip=>chip.classList.toggle(\'is-favorite\',favorite));\n  }\n  async function openArtistMenu(artist){\n    artist=String(artist||\'\').trim();\n    if(!artist)return;\n    openSheet(artist,\'<div class="sheet-message">Loading artist options…</div>\');\n    try{\n      const info=await getArtistState(artist);\n      markArtistChips(artist,info.manual_tags||[]);\n      openSheet(artist,`<div class="sheet-section"><div class="sheet-section-title">Classification tags</div>${styleTagHtml(artist,info)}</div><div class="sheet-section"><div class="sheet-section-title">Ranker actions</div><div class="sheet-grid"><button data-artist-toggle="${escapeHtml(artist)}" class="${info.is_favorite?\'success\':\'\'}">${info.is_favorite?\'★ Favorited\':\'☆ Favorite artist\'}</button><button data-nav="artists" data-artist="${escapeHtml(artist)}">Open in Artists ranking</button><button data-nav="gallery" data-artist="${escapeHtml(artist)}">See all Gallery duels</button><button data-copy-artist="${escapeHtml(artist)}">Copy NovelAI artist tag</button></div></div><div class="sheet-section"><div class="sheet-section-title">Search artist in</div><div class="sheet-grid"><a target="_blank" rel="noopener" href="${searchUrl(\'gelbooru\',artist)}">Gelbooru</a><a target="_blank" rel="noopener" href="${searchUrl(\'rule34\',artist)}">Rule34</a><a target="_blank" rel="noopener" href="${searchUrl(\'google\',artist)}" class="wide">Google Images</a></div></div><div class="sheet-section"><div class="sheet-section-title">Favorite tags and note</div><label>Searchable favorite tags</label><input id="artistFavTags" type="text" value="${escapeHtml(info.favorite_tags||\'\')}"><label>Favorite note</label><textarea id="artistFavNote">${escapeHtml(info.favorite_note||\'\')}</textarea><button class="sheet-full-btn" data-artist-save-favorite="${escapeHtml(artist)}">Save favorite details</button></div><div class="sheet-section"><div class="sheet-section-title">Private artist note</div><textarea id="artistPrivateNote">${escapeHtml(info.private_note||\'\')}</textarea><button class="sheet-full-btn" data-artist-save-note="${escapeHtml(artist)}">Save private note</button></div><div class="sheet-message" id="sheetMessage"></div>`);\n    }catch(error){\n      openSheet(artist,`<div class="sheet-message">Could not load artist actions: ${escapeHtml(error.message||error)}</div>`);\n    }\n  }\n  function openSideMenu(side){openSheet(`Image ${side}`,sideMenuHtml(side))}\n\n  async function apiPost(url,payload){const r=await fetch(url,{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(payload)});let body={};try{body=await r.json()}catch{}if(!r.ok)throw new Error(body.detail||body.error||`HTTP ${r.status}`);return body}\n  function setSheetMessage(message){const el=$(\'sheetMessage\');if(el)el.textContent=message}\n  function navigateRanker(destination,artist){localStorage.setItem(\'artistEloDedicatedNavigation\',JSON.stringify({destination,artist,terms:destination===\'gallery\'?[artist]:undefined}));location.href=\'/ranker/\'}\n  async function copyText(text){try{await navigator.clipboard.writeText(text);toast(\'Copied\')}catch{window.prompt(\'Copy:\',text)}}\n  function wireSheetActions(){\n    if(refs.sheetBody.dataset.actionsWired===\'true\')return;\n    refs.sheetBody.dataset.actionsWired=\'true\';\n    refs.sheetBody.addEventListener(\'click\',async event=>{\n      const control=event.target.closest?.(\'button,a\');if(!control||!refs.sheetBody.contains(control))return;\n      if(control.dataset.action){event.preventDefault();closeSheet();submitAction(control.dataset.action);return}\n      if(control.dataset.openGeneration){event.preventDefault();closeSheet();switchScreen(\'generation\');return}\n      if(control.dataset.openArtist){event.preventDefault();openArtistMenu(control.dataset.openArtist);return}\n      if(control.dataset.nav){event.preventDefault();navigateRanker(control.dataset.nav,control.dataset.artist);return}\n      if(control.dataset.copyArtist){event.preventDefault();copyText(`1::artist:${control.dataset.copyArtist} ::,`);return}\n      const run=async(message,callback)=>{control.disabled=true;setSheetMessage(message);try{const result=await callback();setSheetMessage(result?.message||\'Saved\')}catch(error){setSheetMessage(error.message||String(error))}finally{control.disabled=false}};\n      if(control.dataset.favorite){event.preventDefault();await run(\'Saving…\',()=>apiPost(\'/api/duel/favorite\',{target:control.dataset.favorite}));return}\n      if(control.dataset.bad){event.preventDefault();await run(\'Saving…\',()=>apiPost(\'/api/duel/bad-image\',{side:control.dataset.bad}));return}\n      if(control.dataset.artistToggle){event.preventDefault();const artist=control.dataset.artistToggle;await run(\'Saving favorite…\',async()=>{const result=await apiPost(\'/api/duel/artist/favorite\',{artist,mode:\'toggle\'});applyArtistFavoriteState(artist,result.state||{});return result});return}\n      if(control.dataset.artistSaveFavorite){event.preventDefault();const artist=control.dataset.artistSaveFavorite;await run(\'Saving details…\',async()=>{const result=await apiPost(\'/api/duel/artist/favorite\',{artist,mode:\'save\',tags:$(\'artistFavTags\')?.value||\'\',note:$(\'artistFavNote\')?.value||\'\'});applyArtistFavoriteState(artist,result.state||{});return result});return}\n      if(control.dataset.artistSaveNote){event.preventDefault();await run(\'Saving note…\',()=>apiPost(\'/api/duel/artist/note\',{artist:control.dataset.artistSaveNote,note:$(\'artistPrivateNote\')?.value||\'\'}));return}\n      if(control.dataset.artistStyle){event.preventDefault();const artist=control.dataset.artistStyle,before=control.getAttribute(\'aria-pressed\')===\'true\';control.setAttribute(\'aria-pressed\',before?\'false\':\'true\');const tags=[...refs.sheetBody.querySelectorAll(\'[data-artist-style][aria-pressed="true"]\')].map(item=>item.dataset.styleId);await run(\'Saving classification…\',async()=>{try{const result=await apiPost(\'/api/duel/artist/tags\',{artist,tags});markArtistChips(artist,result.tags||[]);return result}catch(error){control.setAttribute(\'aria-pressed\',before?\'true\':\'false\');throw error}});return}\n      if(control.dataset.galleryApplyFilters){event.preventDefault();applyGalleryFiltersFromSheet(false);return}\n      if(control.dataset.galleryResetFilters){event.preventDefault();applyGalleryFiltersFromSheet(true);return}\n      if(control.dataset.galleryOpenFavoriteEditor){event.preventDefault();openSheet(\'Favorite details\',galleryFavoriteSheetHtml());setTimeout(()=>{populateGalleryFavoriteEditor();$(\'galleryFavoriteTarget\')?.addEventListener(\'change\',populateGalleryFavoriteEditor)},0);return}\n      if(control.dataset.gallerySaveFavorite){event.preventDefault();await run(\'Saving favorite…\',async()=>{const label=$(\'galleryFavoriteTarget\')?.value||\'Duel — both images\';const result=await apiPost(\'/api/duel/gallery/favorite\',{history_number:state.gallery.detail?.history_number,target:label,action:\'save\',tags:$(\'galleryFavoriteTags\')?.value||\'\',note:$(\'galleryFavoriteNote\')?.value||\'\'});state.gallery.detail=result.detail;renderGalleryDetail(result.detail);return result});return}\n      if(control.dataset.galleryRemoveFavorite){event.preventDefault();await run(\'Removing favorite…\',async()=>{const label=$(\'galleryFavoriteTarget\')?.value||\'Duel — both images\';const result=await apiPost(\'/api/duel/gallery/favorite\',{history_number:state.gallery.detail?.history_number,target:label,action:\'delete\'});state.gallery.detail=result.detail;renderGalleryDetail(result.detail);return result});return}\n      if(control.dataset.galleryOpenCorrection){event.preventDefault();openSheet(\'Correct historical result\',galleryCorrectionSheetHtml());return}\n      if(control.dataset.galleryCorrect){event.preventDefault();if(!$(\'galleryCorrectConfirm\')?.checked){setSheetMessage(\'Confirm the historical rating rebuild first.\');return}await run(\'Rebuilding ratings…\',async()=>{const result=await apiPost(\'/api/duel/gallery/correct\',{history_number:state.gallery.detail?.history_number,outcome:$(\'galleryCorrectOutcome\')?.value||\'\',confirmed:true});state.gallery.detail=result.detail;renderGalleryDetail(result.detail);loadGallery(true);return result});return}\n      if(control.dataset.galleryBad){event.preventDefault();await run(\'Saving bad-image tag…\',()=>apiPost(\'/api/duel/gallery/bad-image\',{history_number:state.gallery.detail?.history_number,side:control.dataset.galleryBad}));return}\n      if(control.dataset.galleryCopySeed){event.preventDefault();copyText(String(state.gallery.detail?.seed||0));return}\n    });\n    refs.sheetBody.addEventListener(\'change\',event=>{const target=event.target;if(target.id===\'sheetBlind\'){state.settings.blind=target.checked;saveSettings();renderArtists()}else if(target.id===\'sheetReveal\'){state.settings.reveal=target.checked;saveSettings()}else if(target.id===\'sheetSessionStats\'){state.settings.showSessionStats=target.checked;saveSettings();applyDisplaySettings()}else if(target.id===\'sheetDuelType\'){state.settings.showDuelType=target.checked;saveSettings();applyDisplaySettings()}else if(target.id===\'sheetSounds\'){setSoundEnabled(target.checked);if(target.checked)playSound(\'choose\')}else if(target.id===\'sheetSoundVolume\'){setSoundVolume(target.value);playSound(\'choose\')}});\n    refs.sheetBody.addEventListener(\'input\',event=>{if(event.target.id===\'sheetSoundVolume\')setSoundVolume(event.target.value)});\n  }\n\n  let generationSaveTimer=0,generationStatusTimer=0,generationSaveInFlight=false,generationSavePending=false,generationSaveRevision=0;\n  function generationMessage(message,isError=false,autoClear=false){clearTimeout(generationStatusTimer);refs.generationStatus.textContent=message||\'\';refs.generationStatus.style.color=isError?\'#ff8c8c\':\'\';if(autoClear&&message)generationStatusTimer=setTimeout(()=>{if(!generationSaveInFlight&&!generationSavePending)refs.generationStatus.textContent=\'Changes apply automatically.\'},1500)}\n  function presetEntries(){return state.generation?.profiles||state.generation?.presets||{}}\n  function selectedRotationNames(){return [...refs.rotationList.querySelectorAll(\'input[type=checkbox]:checked\')].map(input=>input.value)}\n  function fillGenerationSelect(select,entries,currentValue){select.innerHTML=\'\';for(const entry of entries||[]){const option=document.createElement(\'option\');option.value=String(entry.value??\'\');option.textContent=String(entry.label??entry.value??\'\');select.appendChild(option)}if([...select.options].some(option=>option.value===String(currentValue??\'\')))select.value=String(currentValue??\'\')}\n  function renderRotationList(selectedNames=null){const selected=new Set(selectedNames??state.generation?.settings?.rotation_names??[]);refs.rotationList.innerHTML=\'\';const names=Object.keys(presetEntries()).sort((a,b)=>a.localeCompare(b,undefined,{sensitivity:\'base\'}));if(!names.length){refs.rotationList.innerHTML=\'<div class="coverage-note">Save at least one generation profile to use rotation.</div>\';return}for(const name of names){const profile=presetEntries()[name]||{};const ownership=profile.ownership===\'full\'?\'Complete\':profile.ownership===\'prompt_resolution\'?\'Prompt + resolution\':\'Prompt only\';const label=document.createElement(\'label\');label.className=\'rotation-choice\';label.innerHTML=`<input type="checkbox" value="${escapeHtml(name)}" ${selected.has(name)?\'checked\':\'\'}><span>${escapeHtml(name)} · ${escapeHtml(ownership)}</span>`;refs.rotationList.appendChild(label)}}\n  function renderPresetCatalog(payload,preferredSelection=\'\',preserveRotation=false){const beforeRotation=preserveRotation?selectedRotationNames():null;state.generation=payload;const profiles=payload.profiles||payload.presets||{};const selected=preferredSelection||refs.presetSelect.value;refs.presetSelect.innerHTML=\'<option value="">Select a generation profile</option>\';for(const name of Object.keys(profiles).sort((a,b)=>a.localeCompare(b,undefined,{sensitivity:\'base\'}))){const option=document.createElement(\'option\');option.value=name;option.textContent=name;refs.presetSelect.appendChild(option)}if(selected&&profiles[selected])refs.presetSelect.value=selected;renderRotationList(beforeRotation)}\n  function updateProfileOwnershipHelp(){\n    const ownership=refs.profileOwnership.value||\'prompt_only\';\n    if(ownership===\'full\')refs.profileOwnershipHelp.innerHTML=\'<strong>Complete configuration</strong>Stores both prompts, resolution, steps, sampler, noise schedule, auto-negative preset, quality tags, decrisp, and variety boost.\';\n    else if(ownership===\'prompt_resolution\')refs.profileOwnershipHelp.innerHTML=\'<strong>Prompt + resolution</strong>Stores both prompts and the Resolution section. Complete-generation settings remain current defaults but are not saved in this profile.\';\n    else refs.profileOwnershipHelp.innerHTML=\'<strong>Prompt only</strong>Stores the positive and negative prompts. Resolution and complete-generation settings remain current defaults but are not saved in this profile.\';\n  }\n  function renderGeneration(payload){state.generation=payload;state.generationLoaded=true;const settings=payload.settings||{};refs.genBufferTarget.min=String(payload.buffer_min||1);refs.genBufferTarget.max=String(payload.buffer_max||50);refs.genBufferTarget.value=String(settings.target_buffer_size||5);refs.genUcPreset.value=String(settings.uc_preset??0);refs.genQuality.checked=settings.quality_toggle!==false;refs.genPaused.checked=!!settings.generation_paused;refs.genPositive.value=settings.positive_prompt_text||\'\';refs.genNegative.value=settings.negative_prompt_text||\'\';fillGenerationSelect(refs.genResolutionPreset,payload.resolution_presets||[],settings.resolution_preset||\'portrait\');refs.genWidth.value=String(settings.width||832);refs.genHeight.value=String(settings.height||1216);refs.genSteps.value=String(settings.steps||28);fillGenerationSelect(refs.genSampler,payload.sampler_choices||[],settings.sampler||\'k_euler_ancestral\');fillGenerationSelect(refs.genScheduler,payload.scheduler_choices||[],settings.scheduler||\'default\');refs.genDecrisp.checked=!!settings.decrisp_mode;refs.genVariety.checked=!!settings.variety_boost;fillGenerationSelect(refs.profileOwnership,payload.profile_ownership_choices||[],refs.profileOwnership.value||\'prompt_only\');refs.rotationEnabled.checked=!!settings.rotation_enabled;renderPresetCatalog(payload,\'\',false);updateProfileOwnershipHelp();refs.generationLoading.hidden=true;refs.generationForm.hidden=false;generationMessage(\'Changes apply automatically.\')}\n  async function loadGeneration(force=false){if(state.generationLoaded&&!force)return;refs.generationLoading.hidden=false;refs.generationForm.hidden=true;try{const r=await fetch(\'/api/duel/generation\',{cache:\'no-store\'});let body={};try{body=await r.json()}catch{}if(!r.ok)throw new Error(body.detail||`HTTP ${r.status}`);renderGeneration(body)}catch(error){refs.generationLoading.textContent=`Could not load generation settings: ${error.message||error}`}}\n  function generationSettingsPayload(){return{positive_prompt:refs.genPositive.value,negative_prompt:refs.genNegative.value,quality_toggle:refs.genQuality.checked,uc_preset:Number(refs.genUcPreset.value),target_buffer_size:Number(refs.genBufferTarget.value),generation_paused:refs.genPaused.checked,rotation_enabled:refs.rotationEnabled.checked,rotation_names:selectedRotationNames(),resolution_preset:refs.genResolutionPreset.value,width:Number(refs.genWidth.value),height:Number(refs.genHeight.value),steps:Number(refs.genSteps.value),sampler:refs.genSampler.value,scheduler:refs.genScheduler.value,decrisp_mode:refs.genDecrisp.checked,variety_boost:refs.genVariety.checked}}\n  function scheduleGenerationSave(delay=0){if(!state.generationLoaded)return;clearTimeout(generationSaveTimer);generationSavePending=true;generationSaveRevision++;generationMessage(delay>0?\'Updating automatically…\':\'Applying changes…\');generationSaveTimer=setTimeout(flushGenerationSave,Math.max(0,delay))}\n  async function flushGenerationSave(){clearTimeout(generationSaveTimer);if(generationSaveInFlight){generationSavePending=true;return}if(!generationSavePending)return;generationSavePending=false;generationSaveInFlight=true;const revision=generationSaveRevision,payload=generationSettingsPayload();generationMessage(\'Applying changes…\');try{const result=await apiPost(\'/api/duel/generation/settings\',payload);if(result.state)state.generation=result.state;if(revision===generationSaveRevision&&!generationSavePending)generationMessage(\'Up to date.\',false,true)}catch(error){generationMessage(`Could not apply changes: ${error.message||error}`,true)}finally{generationSaveInFlight=false;if(generationSavePending)generationSaveTimer=setTimeout(flushGenerationSave,0)}}\n  function applyResolutionPreset(){const entry=(state.generation?.resolution_presets||[]).find(item=>String(item.value)===refs.genResolutionPreset.value);if(entry&&entry.value!==\'custom\'&&entry.width&&entry.height){refs.genWidth.value=String(entry.width);refs.genHeight.value=String(entry.height)}}\n  function wireGenerationAutosave(){const immediate=[refs.genUcPreset,refs.genQuality,refs.genPaused,refs.rotationEnabled,refs.genResolutionPreset,refs.genSampler,refs.genScheduler,refs.genDecrisp,refs.genVariety];for(const control of immediate)control.addEventListener(\'change\',()=>{if(control===refs.genResolutionPreset)applyResolutionPreset();scheduleGenerationSave(0)});for(const numberInput of [refs.genBufferTarget,refs.genWidth,refs.genHeight,refs.genSteps]){numberInput.addEventListener(\'input\',()=>scheduleGenerationSave(260));numberInput.addEventListener(\'change\',()=>scheduleGenerationSave(0))}for(const editor of [refs.genPositive,refs.genNegative]){editor.addEventListener(\'input\',()=>scheduleGenerationSave(480));editor.addEventListener(\'blur\',()=>scheduleGenerationSave(0))}refs.rotationList.addEventListener(\'change\',event=>{if(event.target.matches(\'input[type=checkbox]\'))scheduleGenerationSave(0)})}\n  async function savePresetFromForm(){const name=refs.presetName.value.trim();if(!name){generationMessage(\'Enter a profile name.\',true);return}refs.savePreset.disabled=true;try{const settings=generationSettingsPayload();const result=await apiPost(\'/api/duel/generation/preset/save\',{name,positive_prompt:settings.positive_prompt,negative_prompt:settings.negative_prompt,ownership:refs.profileOwnership.value,notes:refs.profileNotes.value,resolution_preset:settings.resolution_preset,width:settings.width,height:settings.height,steps:settings.steps,sampler:settings.sampler,scheduler:settings.scheduler,uc_preset:settings.uc_preset,quality_toggle:settings.quality_toggle,decrisp_mode:settings.decrisp_mode,variety_boost:settings.variety_boost});renderPresetCatalog(result.state,name,true);refs.presetSelect.value=name;refs.presetName.value=name;generationMessage(result.message||\'Profile saved.\',false,true)}catch(error){generationMessage(error.message||String(error),true)}finally{refs.savePreset.disabled=false}}\n  async function deleteSelectedPreset(){const name=refs.presetSelect.value;if(!name){generationMessage(\'Select a generation profile first.\',true);return}if(!confirm(`Delete generation profile “${name}”?`))return;refs.deletePreset.disabled=true;try{const result=await apiPost(\'/api/duel/generation/preset/delete\',{name});renderPresetCatalog(result.state,\'\',false);refs.presetName.value=\'\';refs.profileNotes.value=\'\';generationMessage(result.message||\'Profile deleted.\',false,true)}catch(error){generationMessage(error.message||String(error),true)}finally{refs.deletePreset.disabled=false}}\n  function loadSelectedPreset(){const name=refs.presetSelect.value,profile=presetEntries()[name];if(!profile){generationMessage(\'Select a generation profile first.\',true);return}refs.genPositive.value=profile.positive||\'\';refs.genNegative.value=profile.negative||\'\';refs.presetName.value=name;refs.profileOwnership.value=profile.ownership||\'prompt_only\';refs.profileNotes.value=profile.notes||\'\';if(profile.ownership===\'prompt_resolution\'||profile.ownership===\'full\'){refs.genResolutionPreset.value=profile.resolution_preset||\'custom\';refs.genWidth.value=String(profile.width||832);refs.genHeight.value=String(profile.height||1216)}if(profile.ownership===\'full\'){refs.genSteps.value=String(profile.steps||28);refs.genSampler.value=profile.sampler||\'k_euler_ancestral\';refs.genScheduler.value=profile.scheduler||\'default\';refs.genUcPreset.value=String(profile.uc_preset??0);refs.genQuality.checked=profile.quality_toggle!==false;refs.genDecrisp.checked=!!profile.decrisp_mode;refs.genVariety.checked=!!profile.variety_boost}updateProfileOwnershipHelp();scheduleGenerationSave(0);generationMessage(`Loaded ${name}.`,false,true)}\n  function applyScreenAnimation(page, className){if(!page)return;page.classList.remove(\'screen-enter-forward\',\'screen-enter-back\');if(className)page.classList.add(className)}\n\n  function artistLadderQuery(){const f=state.artists.filters;return new URLSearchParams({q:f.q||\'\',sort:f.sort||\'top\',stage:f.stage||\'\',favorites:String(!!f.favorites),offset:String(state.artists.offset),limit:String(state.artists.limit)})}\n  function artistBadgeHtml(badges){return (badges||[]).slice(0,5).map(item=>`<span class="ladder-badge">${escapeHtml(item.icon||\'\')} ${escapeHtml(item.label||\'\')}</span>`).join(\'\')}\n  function artistLadderCardHtml(item){const top50=(Number(item.top50_probability||0)*100).toFixed(1);const record=`${Number(item.wins||0)}–${Number(item.losses||0)}–${Number(item.ties||0)}`;return `<article class="ladder-card" data-ladder-artist="${escapeHtml(item.artist)}"><button class="ladder-card-main" type="button" data-open-artist="${escapeHtml(item.artist)}"><div class="ladder-card-head"><span class="ladder-rank">#${Number(item.rank||0)}</span><span><span class="ladder-name">${escapeHtml(item.artist)}</span><span class="ladder-stage">${escapeHtml(item.stage||\'Unknown\')} · ${Number(item.duels||0)} duels</span></span></div><div class="ladder-metrics"><span class="ladder-metric"><span>Top score</span><strong>${Number(item.top_score||0).toFixed(1)}</strong></span><span class="ladder-metric"><span>μ ± σ</span><strong>${Number(item.top_mu||0).toFixed(1)} ± ${Number(item.top_sigma||0).toFixed(1)}</strong></span><span class="ladder-metric"><span>Top 50</span><strong>${top50}%</strong></span><span class="ladder-metric"><span>Record</span><strong>${record}</strong></span></div><div class="ladder-badges">${artistBadgeHtml(item.badges)}</div></button><button class="ladder-star ${item.favorite?\'active\':\'\'}" type="button" data-ladder-favorite="${escapeHtml(item.artist)}" aria-label="Toggle favorite artist">${item.favorite?\'★\':\'☆\'}</button></article>`}\n  function renderArtistLadder(payload,reset){if(reset)state.artists.items=[];state.artists.items.push(...(payload.items||[]));state.artists.total=Number(payload.total||0);state.artists.offset=state.artists.items.length;state.artists.hasMore=!!payload.has_more;state.artists.loaded=true;refs.artistLadderList.innerHTML=state.artists.items.length?state.artists.items.map(artistLadderCardHtml).join(\'\'):\'<div class="ladder-empty">No artists match these filters.</div>\';refs.artistLadderSummary.textContent=`${state.artists.items.length} of ${state.artists.total} artists`;refs.artistLadderPosition.textContent=payload.sort_label||\'\';refs.artistLadderLoadMore.hidden=!state.artists.hasMore;refs.artistLadderLoadMore.disabled=false;refs.artistLadderLoadMore.textContent=\'Load more artists\';refs.artistLadderFavorites.classList.toggle(\'active\',state.artists.filters.favorites)}\n  async function loadArtistLadder(reset=false){if(state.artists.loading)return;state.artists.loading=true;if(reset){state.artists.offset=0;refs.artistLadderSummary.textContent=\'Loading artists…\'}try{const response=await fetch(`/api/duel/artists?${artistLadderQuery()}`,{cache:\'no-store\'});let body={};try{body=await response.json()}catch{}if(!response.ok)throw new Error(body.detail||`HTTP ${response.status}`);renderArtistLadder(body,reset)}catch(error){refs.artistLadderList.innerHTML=`<div class="ladder-empty">Could not load artists: ${escapeHtml(error.message||error)}</div>`;refs.artistLadderSummary.textContent=\'Artist ladder unavailable\'}finally{state.artists.loading=false}}\n  function refreshLadderFavorite(artist,favorite){const card=refs.artistLadderList.querySelector(`[data-ladder-artist="${CSS.escape(String(artist))}"]`);const star=card?.querySelector(\'[data-ladder-favorite]\');if(star){star.textContent=favorite?\'★\':\'☆\';star.classList.toggle(\'active\',favorite)}const item=state.artists.items.find(entry=>entry.artist===artist);if(item)item.favorite=favorite;if(state.artists.filters.favorites&&!favorite){state.artists.items=state.artists.items.filter(entry=>entry.artist!==artist);refs.artistLadderList.innerHTML=state.artists.items.length?state.artists.items.map(artistLadderCardHtml).join(\'\'):\'<div class="ladder-empty">No favorite artists match these filters.</div>\';refs.artistLadderSummary.textContent=`${state.artists.items.length} of ${Math.max(0,state.artists.total-1)} artists`}}\n  function wireArtistLadder(){let timer=0;refs.artistLadderSearch.addEventListener(\'input\',()=>{clearTimeout(timer);timer=setTimeout(()=>{state.artists.filters.q=refs.artistLadderSearch.value.trim();loadArtistLadder(true)},260)});refs.artistLadderSort.addEventListener(\'change\',()=>{state.artists.filters.sort=refs.artistLadderSort.value;loadArtistLadder(true)});refs.artistLadderStage.addEventListener(\'change\',()=>{state.artists.filters.stage=refs.artistLadderStage.value;loadArtistLadder(true)});refs.artistLadderFavorites.addEventListener(\'click\',()=>{state.artists.filters.favorites=!state.artists.filters.favorites;loadArtistLadder(true)});refs.artistLadderRefresh.addEventListener(\'click\',()=>loadArtistLadder(true));refs.artistLadderLoadMore.addEventListener(\'click\',()=>{refs.artistLadderLoadMore.disabled=true;refs.artistLadderLoadMore.textContent=\'Loading…\';loadArtistLadder(false)});refs.artistLadderList.addEventListener(\'click\',async event=>{const star=event.target.closest(\'[data-ladder-favorite]\');if(star){event.preventDefault();event.stopPropagation();const artist=star.dataset.ladderFavorite;star.disabled=true;try{const result=await apiPost(\'/api/duel/artist/favorite\',{artist,mode:\'toggle\'});refreshLadderFavorite(artist,!!result.state?.is_favorite)}catch(error){toast(error.message||String(error))}finally{star.disabled=false}return}const open=event.target.closest(\'[data-open-artist]\');if(open)openArtistMenu(open.dataset.openArtist)})}\n\n  function restoreGalleryFilters(){try{const saved=JSON.parse(localStorage.getItem(\'artistElo.mobileGalleryFilters\')||\'{}\');if(saved&&typeof saved===\'object\')Object.assign(state.gallery.filters,saved)}catch{}const sizes=Array.isArray(state.gallery.filters.sizes)?state.gallery.filters.sizes:[];state.gallery.filters.sizes=[...new Set(sizes.map(Number).filter(value=>[1,2,3].includes(value)))]}\n  function saveGalleryFilters(){try{localStorage.setItem(\'artistElo.mobileGalleryFilters\',JSON.stringify(state.gallery.filters))}catch{}}\n  function galleryOutcomeInfo(outcome){outcome=String(outcome||\'\').toUpperCase();if(outcome===\'A\')return{label:\'A won\',cls:\'a\',a:\'winner\',b:\'loser\'};if(outcome===\'B\')return{label:\'B won\',cls:\'b\',a:\'loser\',b:\'winner\'};if(outcome===\'TIE\')return{label:\'Tie\',cls:\'tie\',a:\'tie\',b:\'tie\'};if(outcome===\'BOTH_BAD\')return{label:\'Both bad\',cls:\'bad\',a:\'bad\',b:\'bad\'};if(outcome===\'INVALID\')return{label:\'Invalid\',cls:\'invalid\',a:\'invalid\',b:\'invalid\'};return{label:outcome||\'Unknown\',cls:\'\',a:\'\',b:\'\'}}\n  function galleryArtistsText(items){return (items||[]).join(\' + \')||\'Unknown\'}\n  function galleryActiveCount(){const f=state.gallery.filters;return [f.q,f.artist,f.exact,f.preset,f.favorite,f.lost,f.outcome!==\'all\',f.images!==\'all\',Array.isArray(f.sizes)&&f.sizes.length>0].filter(Boolean).length}\n  function syncGalleryQuickFilters(){const f=state.gallery.filters,sizes=new Set((f.sizes||[]).map(Number));for(const [button,size] of [[refs.galleryQuickSolo,1],[refs.galleryQuickDuo,2],[refs.galleryQuickTrio,3]]){const active=sizes.has(size);button.classList.toggle(\'active\',active);button.setAttribute(\'aria-pressed\',String(active))}refs.galleryQuickFavorites.classList.toggle(\'active\',!!f.favorite);refs.galleryQuickBothBad.classList.toggle(\'active\',f.outcome===\'both_bad\');refs.galleryQuickMissing.classList.toggle(\'active\',f.images===\'missing\');const count=galleryActiveCount();refs.galleryActiveFilterCount.textContent=count?`${count} filter${count===1?\'\':\'s\'}`:\'\'}\n  function galleryParams(offset=0){const f=state.gallery.filters;const params=new URLSearchParams({offset:String(offset),limit:String(state.gallery.limit),q:f.q||\'\',artist:f.artist||\'\',exact:String(!!f.exact),preset:f.preset||\'\',favorite:String(!!f.favorite),lost:String(!!f.lost),outcome:f.outcome||\'all\',images:f.images||\'all\',sizes:(f.sizes||[]).join(\',\')});return params}\n  function galleryCardHtml(item){const out=galleryOutcomeInfo(item.outcome);const imageA=item.image_a_available?`<img loading="lazy" decoding="async" src="${escapeHtml(item.image_a_url)}" alt="Historical image A">`:\'<div class="gallery-image-missing">Image A missing</div>\';const imageB=item.image_b_available?`<img loading="lazy" decoding="async" src="${escapeHtml(item.image_b_url)}" alt="Historical image B">`:\'<div class="gallery-image-missing">Image B missing</div>\';const meta=[item.size_label||\'\',item.match_type,item.preset?`Preset: ${item.preset}`:\'\',item.seed?`Seed ${item.seed}`:\'\'].filter(Boolean).slice(0,4).map(value=>`<span class="gallery-meta-pill">${escapeHtml(value)}</span>`).join(\'\');return `<article class="gallery-duel-card" data-history="${Number(item.history_number)}"><button class="gallery-card-button" type="button" data-open-gallery-duel="${Number(item.history_number)}"><div class="gallery-card-images"><div class="gallery-card-side ${out.a}">${imageA}<span class="gallery-side-letter">A</span></div><div class="gallery-card-side ${out.b}">${imageB}<span class="gallery-side-letter">B</span></div><span class="gallery-outcome-badge ${out.cls}">${escapeHtml(out.label)}</span></div><div class="gallery-card-body"><div class="gallery-card-head"><span class="gallery-card-date">#${Number(item.history_number)} · ${escapeHtml(item.date||\'Unknown\')}</span><span class="gallery-card-star">${item.favorite?\'★\':\'\'}</span></div><div class="gallery-matchup"><div class="gallery-matchup-side">${escapeHtml(galleryArtistsText(item.artists_a))}</div><div class="gallery-vs">VS</div><div class="gallery-matchup-side right">${escapeHtml(galleryArtistsText(item.artists_b))}</div></div><div class="gallery-card-meta">${meta}</div></div></button></article>`}\n  function renderGalleryList(reset=false,incoming=[]){if(reset)refs.galleryList.innerHTML=\'\';if(!state.gallery.items.length){refs.galleryList.innerHTML=\'<div class="gallery-empty"><div><strong>No matching duels</strong><br><span>Change the search or filters, then refresh.</span></div></div>\';refs.galleryLoadMore.hidden=true;return}if(reset)refs.galleryList.innerHTML=state.gallery.items.map(galleryCardHtml).join(\'\');else if(incoming.length)refs.galleryList.insertAdjacentHTML(\'beforeend\',incoming.map(galleryCardHtml).join(\'\'));refs.galleryLoadMore.hidden=!state.gallery.hasMore;refs.galleryLoadMore.disabled=false;refs.galleryLoadMore.textContent=\'Load more duels\'}\n  async function loadGallery(reset=false){if(state.gallery.loading)return;saveGalleryFilters();state.gallery.loading=true;if(reset){state.gallery.offset=0;state.gallery.items=[];refs.gallerySummary.textContent=\'Loading history…\';refs.galleryLoadMore.hidden=true}try{const response=await fetch(`/api/duel/gallery?${galleryParams(state.gallery.offset)}`,{cache:\'no-store\'});let body={};try{body=await response.json()}catch{}if(!response.ok)throw new Error(body.detail||body.error||`HTTP ${response.status}`);state.gallery.total=Number(body.total||0);state.gallery.offset=Number(body.next_offset||0);state.gallery.hasMore=!!body.has_more;const incoming=body.items||[];state.gallery.items=reset?incoming:state.gallery.items.concat(incoming);state.gallery.loaded=true;refs.gallerySummary.textContent=`${state.gallery.items.length.toLocaleString()} of ${state.gallery.total.toLocaleString()} duels`;if(body.warning)toast(body.warning);renderGalleryList(reset,incoming);syncGalleryQuickFilters();if(Array.isArray(body.presets))state.gallery.presets=body.presets}catch(error){refs.gallerySummary.textContent=\'Gallery unavailable\';if(reset)refs.galleryList.innerHTML=`<div class="gallery-empty">Could not load Gallery: ${escapeHtml(error.message||String(error))}</div>`}finally{state.gallery.loading=false}}\n  function galleryFilterSheetHtml(){const f=state.gallery.filters,presets=[\'<option value="">All presets</option>\',...(state.gallery.presets||[]).map(name=>`<option value="${escapeHtml(name)}" ${name===f.preset?\'selected\':\'\'}>${escapeHtml(name)}</option>`)].join(\'\');return `<div class="gallery-filter-form"><label>Artist or matchup<input id="galleryFilterArtist" value="${escapeHtml(f.artist)}" placeholder="artist name, or Artist A VS Artist B"></label><label class="checkline"><input id="galleryFilterExact" type="checkbox" ${f.exact?\'checked\':\'\'}><span>Exact artist combination</span></label><label>Prompt preset<select id="galleryFilterPreset">${presets}</select></label><div><label>Duel sizes</label><div class="sheet-grid"><label class="checkline"><input id="galleryFilterSolo" type="checkbox" ${(f.sizes||[]).includes(1)?\'checked\':\'\'}><span>Solo</span></label><label class="checkline"><input id="galleryFilterDuo" type="checkbox" ${(f.sizes||[]).includes(2)?\'checked\':\'\'}><span>Duo</span></label><label class="checkline"><input id="galleryFilterTrio" type="checkbox" ${(f.sizes||[]).includes(3)?\'checked\':\'\'}><span>Trio</span></label></div><div class="coverage-note">No size selected shows all duels. Select any combination.</div></div><label>Result<select id="galleryFilterOutcome"><option value="all">All results</option><option value="a" ${f.outcome===\'a\'?\'selected\':\'\'}>Image A won</option><option value="b" ${f.outcome===\'b\'?\'selected\':\'\'}>Image B won</option><option value="tie" ${f.outcome===\'tie\'?\'selected\':\'\'}>Tie</option><option value="both_bad" ${f.outcome===\'both_bad\'?\'selected\':\'\'}>Both bad</option><option value="invalid" ${f.outcome===\'invalid\'?\'selected\':\'\'}>Invalid</option></select></label><label>Image files<select id="galleryFilterImages"><option value="all">All records</option><option value="available" ${f.images===\'available\'?\'selected\':\'\'}>Both images available</option><option value="missing" ${f.images===\'missing\'?\'selected\':\'\'}>One or both missing</option></select></label><label class="checkline"><input id="galleryFilterFavorite" type="checkbox" ${f.favorite?\'checked\':\'\'}><span>Favorites only</span></label><label class="checkline"><input id="galleryFilterLost" type="checkbox" ${f.lost?\'checked\':\'\'}><span>Selected artist or matchup lost</span></label><div class="sheet-grid"><button data-gallery-reset-filters="true">Reset</button><button class="success" data-gallery-apply-filters="true">Apply filters</button></div><div class="sheet-message" id="sheetMessage"></div></div>`}\n  function applyGalleryFiltersFromSheet(reset=false){const f=state.gallery.filters;if(reset){Object.assign(f,{artist:\'\',exact:false,preset:\'\',favorite:false,lost:false,outcome:\'all\',images:\'all\',sizes:[]});refs.gallerySearch.value=\'\';f.q=\'\'}else{f.artist=$(\'galleryFilterArtist\')?.value.trim()||\'\';f.exact=!!$(\'galleryFilterExact\')?.checked;f.preset=$(\'galleryFilterPreset\')?.value||\'\';f.favorite=!!$(\'galleryFilterFavorite\')?.checked;f.lost=!!$(\'galleryFilterLost\')?.checked;f.outcome=$(\'galleryFilterOutcome\')?.value||\'all\';f.images=$(\'galleryFilterImages\')?.value||\'all\';f.sizes=[[1,\'galleryFilterSolo\'],[2,\'galleryFilterDuo\'],[3,\'galleryFilterTrio\']].filter(([,id])=>!!$(id)?.checked).map(([size])=>size);if(f.lost&&!f.artist){setSheetMessage(\'Choose an artist or matchup before using lost-only.\');return}}closeSheet();syncGalleryQuickFilters();loadGallery(true)}\n  function galleryTarget(detail,label){return (detail?.targets||[]).find(target=>target.label===label)}\n  async function saveGalleryTarget(label,action=\'toggle\',tags=\'\',note=\'\'){const detail=state.gallery.detail;if(!detail)return;const target=galleryTarget(detail,label);const actualAction=action===\'toggle\'?(target?.is_favorite?\'delete\':\'save\'):action;const result=await apiPost(\'/api/duel/gallery/favorite\',{history_number:detail.history_number,target:label,action:actualAction,tags,note});state.gallery.detail=result.detail;renderGalleryDetail(result.detail);const item=state.gallery.items.find(entry=>entry.history_number===detail.history_number);if(item&&label===\'Duel — both images\')item.favorite=!!galleryTarget(result.detail,label)?.is_favorite;renderGalleryList(true);toast(result.message||\'Saved\')}\n  function galleryFavoriteSheetHtml(){const detail=state.gallery.detail||{},targets=detail.targets||[];const options=targets.map(target=>`<option value="${escapeHtml(target.label)}">${escapeHtml(target.label)}</option>`).join(\'\');return `<div class="gallery-filter-form"><label>Favorite target<select id="galleryFavoriteTarget">${options}</select></label><label>Tags<input id="galleryFavoriteTags" placeholder="comma-separated tags"></label><label>Note<textarea id="galleryFavoriteNote" rows="4" placeholder="Optional note"></textarea></label><div class="sheet-grid"><button class="danger" data-gallery-remove-favorite="true">Remove</button><button class="success" data-gallery-save-favorite="true">Save favorite</button></div><div class="sheet-message" id="sheetMessage"></div></div>`}\n  function populateGalleryFavoriteEditor(){const target=galleryTarget(state.gallery.detail,$(\'galleryFavoriteTarget\')?.value);if(!target)return;if($(\'galleryFavoriteTags\'))$(\'galleryFavoriteTags\').value=target.tags||\'\';if($(\'galleryFavoriteNote\'))$(\'galleryFavoriteNote\').value=target.note||\'\'}\n  function galleryCorrectionSheetHtml(){const d=state.gallery.detail||{};return `<div class="gallery-filter-form"><div class="coverage-note">Changing a historical result rebuilds dependent ratings chronologically. This is intentionally separated from normal browsing.</div><label>Correct result<select id="galleryCorrectOutcome"><option value="A">Image A won</option><option value="B">Image B won</option><option value="TIE">Tie / too close</option><option value="BOTH_BAD">Both bad</option><option value="INVALID">Invalid duel</option></select></label><label class="checkline"><input id="galleryCorrectConfirm" type="checkbox"><span>I understand this rebuilds historical ratings</span></label><button class="danger" data-gallery-correct="true">Apply correction to duel #${Number(d.history_number||0)}</button><div class="sheet-message" id="sheetMessage"></div></div>`}\n  function galleryMoreSheetHtml(){return `<div class="sheet-section"><div class="sheet-section-title">Favorites and labels</div><div class="sheet-grid"><button data-gallery-open-favorite-editor="true">Edit favorite details</button><button data-gallery-bad="A" class="danger">Mark image A bad</button><button data-gallery-bad="B" class="danger">Mark image B bad</button></div></div><div class="sheet-section"><div class="sheet-section-title">History</div><div class="sheet-grid"><button data-gallery-open-correction="true" class="danger">Correct stored result</button><button data-gallery-copy-seed="true">Copy seed</button></div></div><div class="sheet-message" id="sheetMessage"></div>`}\n  function galleryStatusLabel(status){return status===\'winner\'?\'Winner\':status===\'loser\'?\'Lost\':status===\'tie\'?\'Tie\':status===\'bad\'?\'Both bad\':status===\'invalid\'?\'Invalid\':\'—\'}\n  function galleryRatingRows(side){return (side?.artist_changes||[]).map(row=>`<div class="gallery-detail-stat"><strong>${escapeHtml(row.artist)}</strong>μ ${Number(row.top_search||0)>=0?\'+\':\'\'}${Number(row.top_search||0).toFixed(2)} · ELO ${Number(row.legacy_elo||0)>=0?\'+\':\'\'}${Number(row.legacy_elo||0).toFixed(2)}</div>`).join(\'\')}\n  function renderGalleryDetail(detail){state.gallery.detail=detail;const info=galleryOutcomeInfo(detail.outcome);refs.galleryViewerTitle.textContent=`Duel #${Number(detail.history_number||0)} · ${info.label}`;refs.galleryViewerSubtitle.textContent=`${detail.date||\'Unknown\'} · ${detail.match_type||\'Historical duel\'}`;refs.galleryViewerSideA.className=`gallery-viewer-side ${info.a}${detail.image_a_available===false?\' image-missing\':\'\'}`;refs.galleryViewerSideB.className=`gallery-viewer-side ${info.b}${detail.image_b_available===false?\' image-missing\':\'\'}`;refs.galleryViewerStatusA.textContent=galleryStatusLabel(detail.side_a?.status);refs.galleryViewerStatusB.textContent=galleryStatusLabel(detail.side_b?.status);refs.galleryViewerImageA.src=`${detail.image_a_url}${detail.image_a_url.includes(\'?\')?\'&\':\'?\'}full=${state.gallery.full?\'1\':\'0\'}&t=${Date.now()}`;refs.galleryViewerImageB.src=`${detail.image_b_url}${detail.image_b_url.includes(\'?\')?\'&\':\'?\'}full=${state.gallery.full?\'1\':\'0\'}&t=${Date.now()}`;artistButtons(refs.galleryViewerArtistsA,detail.side_a?.artists||[]);artistButtons(refs.galleryViewerArtistsB,detail.side_b?.artists||[]);const duelTarget=galleryTarget(detail,\'Duel — both images\'),aTarget=galleryTarget(detail,\'Image A\'),bTarget=galleryTarget(detail,\'Image B\');refs.galleryFavoriteDuel.textContent=duelTarget?.is_favorite?\'★ Duel saved\':\'☆ Duel\';refs.galleryFavoriteA.textContent=aTarget?.is_favorite?\'★ Image A\':\'☆ Image A\';refs.galleryFavoriteB.textContent=bTarget?.is_favorite?\'★ Image B\':\'☆ Image B\';refs.galleryViewerDetails.innerHTML=`<div class="gallery-detail-grid"><div class="gallery-detail-stat"><span>Date</span><strong>${escapeHtml(detail.date||\'Unknown\')}</strong></div><div class="gallery-detail-stat"><span>Seed</span><strong>${Number(detail.seed||0)}</strong></div><div class="gallery-detail-stat"><span>Match type</span><strong>${escapeHtml(detail.match_type||\'Unknown\')}</strong></div><div class="gallery-detail-stat"><span>Generation profile</span><strong>${escapeHtml(detail.generation_config?.profile_name||detail.preset||\'Manual settings\')}</strong></div><div class="gallery-detail-stat"><span>Generation snapshot</span><strong>${escapeHtml(detail.generation_summary||\'Legacy record\')}</strong></div><div class="gallery-detail-stat"><span>Expected A</span><strong>${(Number(detail.expected_a||.5)*100).toFixed(1)}%</strong></div><div class="gallery-detail-stat"><span>Corrections</span><strong>${Number(detail.correction_count||0)}</strong></div></div>${detail.match_details?`<p>${escapeHtml(detail.match_details)}</p>`:\'\'}`;refs.galleryViewerPrompts.innerHTML=`<strong>Positive A</strong><div class="gallery-prompt">${escapeHtml(detail.prompt_a||\'Not recorded\')}</div><br><strong>Positive B</strong><div class="gallery-prompt">${escapeHtml(detail.prompt_b||\'Not recorded\')}</div><br><strong>Negative</strong><div class="gallery-prompt">${escapeHtml(detail.negative_prompt||\'Not recorded\')}</div>`;refs.galleryViewerRatings.innerHTML=`<div class="gallery-detail-grid">${galleryRatingRows(detail.side_a)}${galleryRatingRows(detail.side_b)}</div>`;const index=state.gallery.items.findIndex(item=>item.history_number===detail.history_number);refs.galleryViewerPosition.textContent=index>=0?`${index+1} / ${state.gallery.total}`:\'\';refs.galleryViewerPrev.disabled=index<=0;refs.galleryViewerNext.disabled=index<0||(!state.gallery.hasMore&&index>=state.gallery.items.length-1);refs.galleryViewerFull.setAttribute(\'aria-pressed\',String(state.gallery.full));refs.galleryViewerFull.classList.toggle(\'active\',state.gallery.full)}\n  async function openGalleryDetail(historyNumber){const wasOpen=refs.galleryViewer.classList.contains(\'open\');refs.galleryViewer.classList.add(\'open\');refs.galleryViewer.setAttribute(\'aria-hidden\',\'false\');document.body.style.overflow=\'hidden\';try{const hash=`#gallery-duel-${Number(historyNumber)}`;if(wasOpen)history.replaceState({galleryViewer:true},\'\',hash);else history.pushState({galleryViewer:true},\'\',hash)}catch{}refs.galleryViewerTitle.textContent=\'Loading duel…\';refs.galleryViewerSubtitle.textContent=\'\';try{const response=await fetch(`/api/duel/gallery/detail/${Number(historyNumber)}`,{cache:\'no-store\'});let body={};try{body=await response.json()}catch{}if(!response.ok)throw new Error(body.detail||body.error||`HTTP ${response.status}`);renderGalleryDetail(body)}catch(error){refs.galleryViewerTitle.textContent=\'Could not load duel\';refs.galleryViewerSubtitle.textContent=error.message||String(error)}}\n  function closeGalleryViewer(fromHistory=false){if(!fromHistory&&location.hash.startsWith(\'#gallery-duel-\')){try{history.back();return}catch{}}refs.galleryViewer.classList.remove(\'open\');refs.galleryViewer.setAttribute(\'aria-hidden\',\'true\');document.body.style.overflow=\'\'}\n  async function galleryNavigate(delta){const detail=state.gallery.detail;if(!detail)return;let index=state.gallery.items.findIndex(item=>item.history_number===detail.history_number);if(delta>0&&index===state.gallery.items.length-1&&state.gallery.hasMore){await loadGallery(false);index=state.gallery.items.findIndex(item=>item.history_number===detail.history_number)}const next=state.gallery.items[index+delta];if(next)openGalleryDetail(next.history_number)}\n  function wireGallery(){restoreGalleryFilters();refs.gallerySearch.value=state.gallery.filters.q||\'\';syncGalleryQuickFilters();let searchTimer=0;refs.gallerySearch.addEventListener(\'input\',()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{state.gallery.filters.q=refs.gallerySearch.value.trim();loadGallery(true)},280)});refs.galleryFilterButton.addEventListener(\'click\',()=>openSheet(\'Gallery filters\',galleryFilterSheetHtml()));refs.galleryRefresh.addEventListener(\'click\',()=>loadGallery(true));const toggleGallerySize=size=>{const sizes=new Set((state.gallery.filters.sizes||[]).map(Number));if(sizes.has(size))sizes.delete(size);else sizes.add(size);state.gallery.filters.sizes=[...sizes].sort();syncGalleryQuickFilters();loadGallery(true)};refs.galleryQuickSolo.addEventListener(\'click\',()=>toggleGallerySize(1));refs.galleryQuickDuo.addEventListener(\'click\',()=>toggleGallerySize(2));refs.galleryQuickTrio.addEventListener(\'click\',()=>toggleGallerySize(3));refs.galleryQuickFavorites.addEventListener(\'click\',()=>{state.gallery.filters.favorite=!state.gallery.filters.favorite;loadGallery(true)});refs.galleryQuickBothBad.addEventListener(\'click\',()=>{state.gallery.filters.outcome=state.gallery.filters.outcome===\'both_bad\'?\'all\':\'both_bad\';loadGallery(true)});refs.galleryQuickMissing.addEventListener(\'click\',()=>{state.gallery.filters.images=state.gallery.filters.images===\'missing\'?\'all\':\'missing\';loadGallery(true)});refs.galleryLoadMore.addEventListener(\'click\',()=>{refs.galleryLoadMore.disabled=true;refs.galleryLoadMore.textContent=\'Loading…\';loadGallery(false)});refs.galleryList.addEventListener(\'click\',event=>{const button=event.target.closest(\'[data-open-gallery-duel]\');if(button)openGalleryDetail(Number(button.dataset.openGalleryDuel))});refs.galleryViewerClose.addEventListener(\'click\',closeGalleryViewer);refs.galleryViewerFull.addEventListener(\'click\',()=>{state.gallery.full=!state.gallery.full;if(state.gallery.detail)renderGalleryDetail(state.gallery.detail)});refs.galleryViewerPrev.addEventListener(\'click\',()=>galleryNavigate(-1));refs.galleryViewerNext.addEventListener(\'click\',()=>galleryNavigate(1));let viewerX=null,viewerY=null;refs.galleryViewer.addEventListener(\'touchstart\',event=>{if(event.target.closest(\'button,input,textarea,select,.artist-chip,summary\'))return;const t=event.touches?.[0];if(t){viewerX=t.clientX;viewerY=t.clientY}},{passive:true});refs.galleryViewer.addEventListener(\'touchend\',event=>{const t=event.changedTouches?.[0];if(viewerX==null||!t)return;const dx=t.clientX-viewerX,dy=t.clientY-viewerY;viewerX=viewerY=null;if(Math.abs(dx)>72&&Math.abs(dx)>Math.abs(dy)*1.35)galleryNavigate(dx<0?1:-1)},{passive:true});window.addEventListener(\'popstate\',()=>{if(refs.galleryViewer.classList.contains(\'open\')&&!location.hash.startsWith(\'#gallery-duel-\'))closeGalleryViewer(true)});refs.galleryFavoriteDuel.addEventListener(\'click\',()=>saveGalleryTarget(\'Duel — both images\'));refs.galleryFavoriteA.addEventListener(\'click\',()=>saveGalleryTarget(\'Image A\'));refs.galleryFavoriteB.addEventListener(\'click\',()=>saveGalleryTarget(\'Image B\'));refs.galleryViewerMore.addEventListener(\'click\',()=>openSheet(\'Historical duel actions\',galleryMoreSheetHtml()));}\n  function applyScreenAnimation(page, className){if(!page)return;page.classList.remove(\'screen-enter-forward\',\'screen-enter-back\');if(className)page.classList.add(className)}\n  const screenPositions={artists:-2,gallery:-1,duel:0,generation:1};\n  function pageForScreen(name){return name===\'artists\'?refs.artistLadderPage:name===\'gallery\'?refs.galleryPage:name===\'generation\'?refs.generationPage:refs.duelPage}\n  function switchScreen(name){if(name===\'artists\'&&!nativeApp)name=\'gallery\';const previous=state.activeScreen||\'duel\';state.screenScroll[previous]=window.scrollY;for(const screen of [\'duel\',\'gallery\',\'artists\',\'generation\']){const page=pageForScreen(screen);if(page)page.hidden=screen!==name}const target=pageForScreen(name);applyScreenAnimation(target,(screenPositions[name]||0)>(screenPositions[previous]||0)?\'screen-enter-forward\':\'screen-enter-back\');if(name===\'generation\'){try{history.replaceState(null,\'\',\'#generation\')}catch{}loadGeneration().catch(()=>{})}else if(name===\'gallery\'){try{history.replaceState(null,\'\',\'#gallery\')}catch{}if(!state.gallery.loaded)loadGallery(true)}else if(name===\'artists\'){try{history.replaceState(null,\'\',\'#artists\')}catch{}if(!state.artists.loaded)loadArtistLadder(true)}else{try{history.replaceState(null,\'\',location.pathname+location.search)}catch{}}state.activeScreen=name;requestAnimationFrame(()=>window.scrollTo({top:state.screenScroll[name]||0,behavior:\'instant\'}))}\n  function resetRibbon(element){element.classList.remove(\'dragging\');element.style.setProperty(\'--ribbon-offset\',\'0px\');element.style.setProperty(\'--ribbon-progress\',\'0\')}\n  function wireProgressRibbon(element,{left=null,right=null,tap=null}={}){if(!element)return;let startX=null,startY=null,moved=false,suppressClick=false;element.addEventListener(\'touchstart\',event=>{const t=event.touches?.[0];if(!t)return;startX=t.clientX;startY=t.clientY;moved=false;suppressClick=false;element.classList.add(\'dragging\')},{passive:true});element.addEventListener(\'touchmove\',event=>{const t=event.touches?.[0];if(startX==null||!t)return;const dx=t.clientX-startX,dy=t.clientY-startY;if(Math.abs(dx)<Math.abs(dy)*1.1)return;if(Math.abs(dx)>4)moved=true;event.preventDefault();const allowed=dx<0?!!left:!!right;const offset=allowed?Math.max(-38,Math.min(38,dx)):Math.max(-12,Math.min(12,dx*.25));element.style.setProperty(\'--ribbon-offset\',`${offset}px`);element.style.setProperty(\'--ribbon-progress\',String(Math.min(1,Math.abs(dx)/86)))},{passive:false});element.addEventListener(\'touchend\',event=>{const t=event.changedTouches?.[0];if(startX==null||!t){resetRibbon(element);return}const dx=t.clientX-startX,dy=t.clientY-startY;startX=startY=null;suppressClick=moved;const horizontal=Math.abs(dx)>52&&Math.abs(dx)>Math.abs(dy)*1.2;resetRibbon(element);if(horizontal){if(dx<0&&left)left();else if(dx>0&&right)right()}else if(!moved&&tap)tap();setTimeout(()=>{suppressClick=false},350)},{passive:true});element.addEventListener(\'touchcancel\',()=>{startX=startY=null;resetRibbon(element)},{passive:true});element.addEventListener(\'click\',event=>{if(suppressClick){event.preventDefault();return}tap?.()})}\n  function wireGeneration(){wireGallery();wireArtistLadder();wireProgressRibbon(refs.navigationRibbon,{left:()=>switchScreen(\'generation\'),right:()=>switchScreen(\'gallery\'),tap:()=>switchScreen(\'generation\')});wireProgressRibbon(refs.galleryArtistRibbon,{right:()=>switchScreen(\'artists\'),tap:()=>switchScreen(\'artists\')});wireProgressRibbon(refs.artistLadderReturnRibbon,{left:()=>switchScreen(\'gallery\'),tap:()=>switchScreen(\'gallery\')});wireProgressRibbon(refs.galleryReturnRibbon,{left:()=>switchScreen(\'duel\'),tap:()=>switchScreen(\'duel\')});wireProgressRibbon(refs.generationReturnRibbon,{right:()=>switchScreen(\'duel\'),tap:()=>switchScreen(\'duel\')});wireProgressRibbon(refs.generationReturnRibbonBottom,{right:()=>switchScreen(\'duel\'),tap:()=>switchScreen(\'duel\')});refs.artistLadderClose.addEventListener(\'click\',()=>switchScreen(\'gallery\'));refs.galleryClose.addEventListener(\'click\',()=>switchScreen(\'duel\'));refs.generationClose.addEventListener(\'click\',()=>switchScreen(\'duel\'));wireGenerationAutosave();refs.savePreset.addEventListener(\'click\',savePresetFromForm);refs.deletePreset.addEventListener(\'click\',deleteSelectedPreset);refs.loadPreset.addEventListener(\'click\',loadSelectedPreset);refs.presetSelect.addEventListener(\'change\',()=>{if(refs.presetSelect.value)refs.presetName.value=refs.presetSelect.value});refs.profileOwnership.addEventListener(\'change\',updateProfileOwnershipHelp);if(location.hash===\'#generation\')switchScreen(\'generation\');else if(location.hash===\'#gallery\')switchScreen(\'gallery\');else if(location.hash===\'#artists\'&&nativeApp)switchScreen(\'artists\')}\n\n  function beginLongPress(side,event){cancelLongPress();if(event.touches&&event.touches.length!==1)return;const start={x:event.touches?.[0]?.clientX??event.clientX,y:event.touches?.[0]?.clientY??event.clientY};state.longPress={side,start,timer:setTimeout(()=>{state.suppressClickUntil=Date.now()+700;openSideMenu(side);state.longPress=null},520)}}\n  function cancelLongPress(){if(state.longPress?.timer)clearTimeout(state.longPress.timer);state.longPress=null}\n  function moveLongPress(event){if(!state.longPress)return;const p=event.touches?.[0]||event;const dx=p.clientX-state.longPress.start.x,dy=p.clientY-state.longPress.start.y;if(Math.hypot(dx,dy)>12)cancelLongPress()}\n\n  function eventClosest(event,selector){const direct=event.target?.closest?.(selector);if(direct)return direct;for(const node of event.composedPath?.()||[]){if(node?.matches?.(selector))return node;const nested=node?.closest?.(selector);if(nested)return nested}return null}\n  function wireCore(){\n    $(\'pickA\').addEventListener(\'click\',()=>submitAction(\'A\'));$(\'pickB\').addEventListener(\'click\',()=>submitAction(\'B\'));$(\'tieBtn\').addEventListener(\'click\',()=>submitAction(\'TIE\'));$(\'bothBadBtn\').addEventListener(\'click\',()=>submitAction(\'BOTH_BAD\'));$(\'skipBtn\').addEventListener(\'click\',()=>submitAction(\'SKIP\'));$(\'undoBtn\').addEventListener(\'click\',()=>submitAction(\'UNDO\'));$(\'refreshBtn\').addEventListener(\'click\',fetchState);refs.emptyRefreshBtn.addEventListener(\'click\',fetchState);refs.toolsButton.addEventListener(\'click\',()=>openSheet(\'Duel tools\',toolMenuHtml()));\n    document.addEventListener(\'click\',event=>{const imageAction=eventClosest(event,\'.image-action-trigger[data-side-menu]\');if(imageAction){event.preventDefault();event.stopPropagation();openSideMenu(imageAction.dataset.sideMenu);return}const chip=eventClosest(event,\'.artist-chip[data-artist]\');if(!chip)return;event.preventDefault();event.stopPropagation();openArtistMenu(chip.dataset.artist)},true);\n    document.addEventListener(\'contextmenu\',event=>{const chip=eventClosest(event,\'.artist-chip[data-artist]\');if(chip){event.preventDefault();event.stopPropagation();openArtistMenu(chip.dataset.artist);return}const stage=eventClosest(event,\'.image-stage\');if(stage){event.preventDefault();event.stopPropagation();openSideMenu(stage===refs.stageA?\'A\':\'B\')}},true);\n    [[\'A\',refs.stageA],[\'B\',refs.stageB]].forEach(([side,stage])=>{stage.addEventListener(\'click\',event=>{if(eventClosest(event,\'.image-action-trigger\'))return;if(Date.now()>=state.suppressClickUntil)submitAction(side)});stage.addEventListener(\'touchstart\',e=>beginLongPress(side,e),{passive:true});stage.addEventListener(\'touchmove\',moveLongPress,{passive:true});stage.addEventListener(\'touchend\',cancelLongPress,{passive:true});stage.addEventListener(\'touchcancel\',cancelLongPress,{passive:true})});\n    document.addEventListener(\'pointerdown\',()=>ensureSound(),{capture:true,passive:true});\n  }\n\n  function avg(touches){let x=0,y=0;for(const t of touches){x+=t.clientX;y+=t.clientY}return{x:x/touches.length,y:y/touches.length}}\n  function inGestureTarget(event){return !event.target.closest(\'.artist-strip,button,a,input,textarea,select\')}\n  function gestureStart(event){if(state.busy||!inGestureTarget(event))return;const t=Array.from(event.touches||[]);if(!t.length)return;const p=avg(t);state.gesture={count:t.length,startX:p.x,startY:p.y,direction:null,progress:0,ready:null,moved:false};}\n  function gestureMove(event){const g=state.gesture;if(!g||state.busy)return;const t=Array.from(event.touches||[]);if(!t.length)return;const p=avg(t),dx=p.x-g.startX,dy=p.y-g.startY,ax=Math.abs(dx),ay=Math.abs(dy);if(ax>9||ay>9)g.moved=true;if(g.count===1){if(ax<18||ax<=ay*1.15){if(ax<12){g.direction=null;g.progress=0;clearGesture()}return}event.preventDefault();g.direction=dx>0?\'B\':\'A\';g.progress=Math.max(0,Math.min(1,(ax-14)/165));applySwipe(g.direction,g.progress)}else if(g.count===2){g.progress=Math.max(0,Math.min(1,(dy-18)/95));g.ready=dy>78&&dy>ax*1.15?\'TIE\':null;if(dy>18&&dy>ax){event.preventDefault();applyMultiGesture(\'TIE\',g.progress)}else clearGesture()}else if(g.count===3){const down=dy>18&&dy>ax,up=dy<-18&&-dy>ax;g.progress=Math.max(0,Math.min(1,((down?dy:up?-dy:0)-18)/95));g.ready=dy>78&&dy>ax*1.15?\'BOTH_BAD\':dy<-78&&-dy>ax*1.15?\'UNDO\':null;if(down){event.preventDefault();applyMultiGesture(\'BOTH_BAD\',g.progress)}else if(up){event.preventDefault();applyMultiGesture(\'UNDO\',g.progress)}else clearGesture()}}\n  async function gestureEnd(event){const g=state.gesture;if(!g||state.busy)return;if(Array.from(event.touches||[]).length)return;state.gesture=null;if(g.moved)state.suppressClickUntil=Date.now()+550;clearGesture();if(g.count===1&&g.direction&&g.progress>=.55)await submitAction(g.direction);else if(g.ready)await submitAction(g.ready)}\n  function wireGestures(){refs.gestureZone.addEventListener(\'touchstart\',gestureStart,{passive:true});refs.gestureZone.addEventListener(\'touchmove\',gestureMove,{passive:false});refs.gestureZone.addEventListener(\'touchend\',gestureEnd,{passive:true});refs.gestureZone.addEventListener(\'touchcancel\',()=>{state.gesture=null;clearGesture()},{passive:true})}\n\n\n  const nativeApp=/ArtistRankerApp\\//i.test(navigator.userAgent)||new URLSearchParams(location.search).get(\'source\')===\'android-app\';\n  let deferredInstallPrompt=null;\n  if(nativeApp){document.body.classList.add(\'native-app\');refs.installBtn.textContent=\'Update app\';refs.installBtn.title=\'Download the newest signed Artist Ranker APK\';refs.installBtn.addEventListener(\'click\',()=>{location.href=`/downloads/artist-ranker.apk?download=${Date.now()}`})}else{\n    refs.installBtn.textContent=\'Install app\';\n    window.addEventListener(\'beforeinstallprompt\',event=>{event.preventDefault();deferredInstallPrompt=event;});\n    refs.installBtn.addEventListener(\'click\',async()=>{if(deferredInstallPrompt){deferredInstallPrompt.prompt();await deferredInstallPrompt.userChoice;deferredInstallPrompt=null;return}if(!window.isSecureContext){toast(\'This HTTP page can only be added as a shortcut. Use the signed Android app for a full installation.\');return}toast(\'Use the browser menu and choose Install app or Add to Home screen.\')});\n  }\n  if(\'serviceWorker\' in navigator){navigator.serviceWorker.register(\'/duel/sw.js\',{scope:\'/duel\'}).catch(error=>console.info(\'PWA service worker unavailable:\',error));}\n\n  applyDisplaySettings();wireCore();wireGestures();wireGeneration();fetchState().catch(e=>toast(`Could not load: ${e.message||e}`));updateSession();\n  let metricTick=0;setInterval(()=>{if(state.busy||state.gesture||document.visibilityState!==\'visible\')return;if(!state.duel){fetchState().catch(()=>{});return}metricTick++;if(metricTick%3===0)fetchMetrics().catch(()=>{});},900);\n})();\n</script>\n</body>\n</html>\n'
 
+# DEDICATED_GENERATION_CFG_PROFILE_V242
+_DEDICATED_CFG_PATCHES = (
+    (
+        '<div class="generation-field"><label for="genSteps">Steps</label><input id="genSteps" type="number" min="1" max="50" step="1"></div>',
+        '<div class="generation-field"><label for="genSteps">Steps</label><input id="genSteps" type="number" min="1" max="50" step="1"></div>\n'
+        '                <div class="generation-field"><label for="genCfg">CFG / guidance</label><input id="genCfg" type="number" min="0" max="10" step="0.1"></div>',
+    ),
+    (
+        "genSteps:$('genSteps'), genSampler:$('genSampler')",
+        "genSteps:$('genSteps'), genCfg:$('genCfg'), genSampler:$('genSampler')",
+    ),
+    (
+        "refs.genSteps.value=String(settings.steps||28);fillGenerationSelect",
+        "refs.genSteps.value=String(settings.steps||28);refs.genCfg.value=String(settings.cfg_scale??6);fillGenerationSelect",
+    ),
+    (
+        "steps:Number(refs.genSteps.value),sampler:",
+        "steps:Number(refs.genSteps.value),cfg_scale:Number(refs.genCfg.value),sampler:",
+    ),
+    (
+        "[refs.genBufferTarget,refs.genWidth,refs.genHeight,refs.genSteps]",
+        "[refs.genBufferTarget,refs.genWidth,refs.genHeight,refs.genSteps,refs.genCfg]",
+    ),
+    (
+        "steps:settings.steps,sampler:",
+        "steps:settings.steps,cfg_scale:settings.cfg_scale,sampler:",
+    ),
+    (
+        "refs.genSteps.value=String(profile.steps||28);refs.genSampler",
+        "refs.genSteps.value=String(profile.steps||28);refs.genCfg.value=String(profile.cfg_scale??6);refs.genSampler",
+    ),
+)
+for _cfg_old, _cfg_new in _DEDICATED_CFG_PATCHES:
+    if _cfg_old not in DEDICATED_DUEL_PAGE_HTML:
+        raise RuntimeError(f"Dedicated generation CFG insertion point is missing: {_cfg_old[:60]}")
+    DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace(_cfg_old, _cfg_new)
+del _cfg_old, _cfg_new
+
 # PHASE7_DEDICATED_DUEL_MENU_CLEANUP_V240
 DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace(
     '.floating-tools { position:absolute; top:7px; left:7px; right:auto; z-index:15; width:38px; height:38px; border-radius:12px; border:1px solid rgba(255,255,255,.15); background:rgba(12,17,24,.86); backdrop-filter:blur(8px); display:grid; place-items:center; font-size:1.2rem; }',
@@ -23600,11 +23922,35 @@ DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace(
 ).replace(
     '              <button class="image-action-trigger" type="button" data-side-menu="B" aria-label="Image B actions">⋯</button>\n', ''
 )
+# DEDICATED_ARTIST_PORTRAITS_V241
+DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace(
+    "</head>",
+    r"""<style id="artist-ranker-ladder-portrait-style">
+  .ladder-card-head{grid-template-columns:48px auto minmax(0,1fr)}
+  .ladder-portrait{width:48px;height:48px;display:grid;place-items:center;border-radius:14px;overflow:hidden;background:var(--panel-3);color:#bed7ff;font-size:1rem;font-weight:850;box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)}
+  .ladder-portrait img{width:100%;height:100%;display:block;object-fit:cover}
+  .ladder-portrait-fallback{display:grid;place-items:center;width:100%;height:100%}
+</style>
+</head>""",
+    1,
+)
+_DEDICATED_LADDER_HEAD = '<div class="ladder-card-head"><span class="ladder-rank">'
+_DEDICATED_LADDER_HEAD_WITH_PORTRAIT = r'''<div class="ladder-card-head"><span class="ladder-portrait">${item.portrait_url?`<img loading="lazy" decoding="async" src="${escapeHtml(item.portrait_url)}" alt="">`:`<span class="ladder-portrait-fallback">${escapeHtml(String(item.artist||'?').slice(0,1).toUpperCase())}</span>`}</span><span class="ladder-rank">'''
+if _DEDICATED_LADDER_HEAD not in DEDICATED_DUEL_PAGE_HTML:
+    raise RuntimeError("Dedicated Artist Ladder portrait insertion point is missing.")
+DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace(
+    _DEDICATED_LADDER_HEAD,
+    _DEDICATED_LADDER_HEAD_WITH_PORTRAIT,
+    1,
+)
 # SECURE_PHONE_PAIRING_CLIENT_V220
 DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace("</head>", '<style id="artist-ranker-pairing-style">\n  #pairingOverlay{position:fixed;inset:0;z-index:2147483600;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(4,7,11,.84);backdrop-filter:blur(10px)}\n  #pairingOverlay.open{display:flex}\n  .pairing-card{width:min(520px,100%);max-height:min(760px,calc(100vh - 28px));overflow:auto;border:1px solid rgba(255,255,255,.12);border-radius:22px;background:#151a22;color:#eef3fb;box-shadow:0 30px 100px rgba(0,0,0,.55);padding:20px}\n  .pairing-title{font-size:1.35rem;font-weight:850}.pairing-subtitle{margin-top:5px;color:#9aa8bc;line-height:1.42}\n  .pairing-server{margin:14px 0;padding:11px 12px;border:1px solid rgba(112,168,255,.22);border-radius:13px;background:rgba(112,168,255,.08)}\n  .pairing-server strong{display:block}.pairing-server span{display:block;margin-top:3px;color:#9aa8bc;font-size:.8rem}\n  .pairing-label{display:block;margin:13px 0 6px;font-size:.78rem;font-weight:780;color:#cbd6e7}\n  .pairing-code-row,.pairing-address-row{display:flex;gap:8px}.pairing-code-row input,.pairing-address-row input{min-width:0;flex:1 1 auto;border:1px solid rgba(255,255,255,.13);border-radius:12px;background:#0e131a;color:#eef3fb;padding:11px 12px}\n  .pairing-code-row input{text-transform:uppercase;letter-spacing:.15em;font-weight:820;text-align:center}\n  .pairing-card button{min-height:42px;border:1px solid rgba(255,255,255,.13);border-radius:12px;background:#222b3a;color:#eef3fb;padding:9px 13px;font-weight:780;cursor:pointer}\n  .pairing-card button.primary{background:#70a8ff;color:#08101b;border-color:#70a8ff}.pairing-card button.danger{color:#ff9696}.pairing-card button:disabled{opacity:.5;cursor:wait}\n  .pairing-status{min-height:1.35em;margin-top:12px;color:#9aa8bc;font-size:.82rem;line-height:1.4}.pairing-status.error{color:#ff9999}.pairing-status.success{color:#76e9a1}\n  .pairing-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}.pairing-actions button{flex:1 1 130px}\n  .pairing-divider{height:1px;background:rgba(255,255,255,.08);margin:16px 0}\n  .pairing-hint{margin-top:9px;color:#8190a5;font-size:.74rem;line-height:1.42}\n  body.pairing-required .page,body.pairing-required #galleryPage,body.pairing-required #generationPage,body.pairing-required #artistLadderPage{filter:blur(3px);pointer-events:none;user-select:none}\n  @media(max-width:520px){.pairing-card{padding:16px;border-radius:18px}.pairing-code-row,.pairing-address-row{flex-direction:column}.pairing-card button{width:100%}}\n</style>\n' + "</head>", 1)
 DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace("<body>", "<body>" + '<div id="pairingOverlay" role="dialog" aria-modal="true" aria-labelledby="pairingTitle">\n  <section class="pairing-card">\n    <div class="pairing-title" id="pairingTitle">Pair this device</div>\n    <div class="pairing-subtitle" id="pairingSubtitle">This ranker accepts only paired devices on the local network.</div>\n    <div class="pairing-server"><strong id="pairingServerName">Artist Ranker</strong><span id="pairingServerDetails">Checking server compatibility…</span></div>\n    <div id="pairingCodeSection">\n      <label class="pairing-label" for="pairingCodeInput">One-use pairing code</label>\n      <div class="pairing-code-row"><input id="pairingCodeInput" maxlength="7" autocomplete="one-time-code" inputmode="text" placeholder="ABC123"><button class="primary" id="pairingSubmit" type="button">Pair</button></div>\n      <div class="pairing-hint">Create the code on the ranker PC under Maintenance → Phone pairing and LAN security. Scanning its QR opens the installed Android app directly.</div>\n    </div>\n    <div class="pairing-divider"></div>\n    <label class="pairing-label" for="pairingServerInput">Manual server address</label>\n    <div class="pairing-address-row"><input id="pairingServerInput" autocomplete="url" placeholder="192.168.1.20:7860"><button id="pairingOpenServer" type="button">Open server</button></div>\n    <div class="pairing-status" id="pairingStatus"></div>\n    <div class="pairing-actions"><button id="pairingClose" type="button">Close</button><button id="pairingForget" class="danger" type="button">Forget this server</button><button id="pairingReload" type="button">Reload</button></div>\n  </section>\n</div>\n', 1)
 DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace("</body>", '<script id="artist-ranker-pairing-client">\n(() => {\n  if (window.__artistRankerPairingClientV220) return;\n  window.__artistRankerPairingClientV220 = true;\n  const PROTOCOL=1;\n  const SERVER_STORAGE_KEY="artistRanker.rememberedServer";\n  const byId=id=>document.getElementById(id);\n  const state={required:false,paired:false,handshake:null,opening:false};\n  const originalFetch=window.fetch.bind(window);\n  const isProtectedUrl=input=>{try{const url=new URL(typeof input===\'string\'?input:input?.url||\'\',location.href);return url.origin===location.origin&&(url.pathname.startsWith(\'/api/duel/\')||url.pathname.startsWith(\'/ranker/\')||url.pathname.startsWith(\'/api/generation-analytics\'));}catch{return false}};\n  const showStatus=(message=\'\',kind=\'\')=>{const node=byId(\'pairingStatus\');if(!node)return;node.textContent=message;node.className=\'pairing-status\'+(kind?` ${kind}`:\'\')};\n  const showOverlay=(required=false,message=\'\')=>{const overlay=byId(\'pairingOverlay\');if(!overlay)return;state.required=!!required;overlay.classList.add(\'open\');document.body.classList.toggle(\'pairing-required\',state.required);byId(\'pairingClose\').hidden=state.required;if(message)showStatus(message,\'error\');};\n  const hideOverlay=()=>{if(state.required)return;byId(\'pairingOverlay\')?.classList.remove(\'open\');document.body.classList.remove(\'pairing-required\')};\n  window.__artistRankerShowPairing=()=>showOverlay(false,\'\');\n  window.fetch=async (...args)=>{const response=await originalFetch(...args);if(response.status===401&&isProtectedUrl(args[0])){let body={};try{body=await response.clone().json()}catch{}showOverlay(true,body.detail||\'Pair this device with the ranker PC before continuing.\')}else if(response.status===426&&isProtectedUrl(args[0])){showOverlay(true,\'This app and server are not protocol-compatible. Update the older side.\')}return response};\n  const normalizeServer=value=>{let text=String(value||\'\').trim();if(!text)return\'\';if(!/^https?:\\/\\//i.test(text))text=\'http://\'+text;text=text.replace(/\\/+$/,\'\');try{const url=new URL(text);return `${url.protocol}//${url.host}/duel?source=android-app`}catch{return\'\'}};\n  const deviceName=()=>{const platform=navigator.userAgentData?.platform||navigator.platform||\'Device\';return `Artist Ranker on ${platform}`.slice(0,80)};\n  async function handshake(){try{const r=await originalFetch(`/api/pairing/handshake?protocol=${PROTOCOL}`,{cache:\'no-store\'});const body=await r.json();state.handshake=body;byId(\'pairingServerName\').textContent=body.server_name||\'Artist Ranker\';byId(\'pairingServerDetails\').textContent=`Server ${body.server_version||\'?\'} · protocol ${body.protocol_current||\'?\'} · ${body.client_mode===\'multi_client\'?\'multi-client\':\'single active voting device\'}`;if(!body.compatible){showOverlay(true,body.compatibility_message||\'App/server update required.\')}return body}catch(error){byId(\'pairingServerDetails\').textContent=\'Server handshake unavailable\';return null}}\n  async function session(){try{const r=await originalFetch(\'/api/pairing/session\',{cache:\'no-store\'});if(!r.ok)return null;const body=await r.json();state.paired=!!body.authorized;if(state.paired){byId(\'pairingSubtitle\').textContent=`Paired as ${body.device_name||\'this device\'}.`;byId(\'pairingCodeSection\').hidden=true;byId(\'pairingForget\').hidden=false;}return body}catch{return null}}\n  async function exchange(code){const normalized=String(code||\'\').toUpperCase().replace(/[^A-Z0-9]/g,\'\');if(normalized.length!==6){showStatus(\'Enter the six-character code shown on the PC.\',\'error\');return false}const button=byId(\'pairingSubmit\');button.disabled=true;showStatus(\'Pairing…\');try{const r=await originalFetch(\'/api/pairing/exchange\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({code:normalized,device_name:deviceName(),protocol:PROTOCOL})});let body={};try{body=await r.json()}catch{}if(!r.ok)throw new Error(body.detail||`HTTP ${r.status}`);state.required=false;state.paired=true;showStatus(\'Paired successfully. Opening Duel…\',\'success\');const url=new URL(location.href);url.searchParams.delete(\'pair\');history.replaceState({},\'\',url.pathname+url.search+url.hash);setTimeout(()=>location.reload(),350);return true}catch(error){showStatus(error.message||String(error),\'error\');return false}finally{button.disabled=false}}\n  async function forget(){const button=byId(\'pairingForget\');button.disabled=true;try{await originalFetch(\'/api/pairing/forget\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:\'{}\'});}catch{}try{localStorage.removeItem(SERVER_STORAGE_KEY)}catch{}state.paired=false;state.required=true;byId(\'pairingCodeSection\').hidden=false;byId(\'pairingSubtitle\').textContent=\'This device has been forgotten. Enter a new one-use code to pair again.\';showOverlay(true,\'Pairing removed.\');button.disabled=false}\n  function installConnectionButton(){const actions=document.querySelector(\'.top-actions\');if(!actions||byId(\'connectionBtn\'))return;const button=document.createElement(\'button\');button.id=\'connectionBtn\';button.className=\'pill-btn\';button.type=\'button\';button.textContent=\'Connection\';button.addEventListener(\'click\',async()=>{await session();showOverlay(false,\'\')});actions.prepend(button)}\n  function wire(){byId(\'pairingSubmit\')?.addEventListener(\'click\',()=>exchange(byId(\'pairingCodeInput\').value));byId(\'pairingCodeInput\')?.addEventListener(\'keydown\',event=>{if(event.key===\'Enter\')exchange(event.currentTarget.value)});byId(\'pairingOpenServer\')?.addEventListener(\'click\',()=>{const target=normalizeServer(byId(\'pairingServerInput\').value);if(!target){showStatus(\'Enter a hostname or IP address, optionally followed by the port.\',\'error\');return}try{localStorage.setItem(SERVER_STORAGE_KEY,target)}catch{}location.href=target});byId(\'pairingForget\')?.addEventListener(\'click\',forget);byId(\'pairingReload\')?.addEventListener(\'click\',()=>location.reload());byId(\'pairingClose\')?.addEventListener(\'click\',hideOverlay);installConnectionButton()}\n  async function start(){wire();try{const remembered=localStorage.getItem(SERVER_STORAGE_KEY)||"";if(remembered)byId("pairingServerInput").value=new URL(remembered).host}catch{}await handshake();const params=new URLSearchParams(location.search);const code=params.get(\'pair\');if(code){showOverlay(true,\'Pairing link detected.\');byId(\'pairingCodeInput\').value=code;await exchange(code);return}const current=await session();if(!current?.authorized){showOverlay(true,\'Enter a code from the ranker PC or scan its QR code.\')}}\n  if(document.readyState===\'loading\')document.addEventListener(\'DOMContentLoaded\',start,{once:true});else start();\n})();\n</script>\n' + "</body>", 1)
 DEDICATED_DUEL_PAGE_HTML = enhance_dedicated_duel_html(DEDICATED_DUEL_PAGE_HTML)
+DEDICATED_DUEL_PAGE_HTML = DEDICATED_DUEL_PAGE_HTML.replace(
+    "</head>", GENERATION_CONTROL_HEAD + "</head>", 1
+)
 
 DEDICATED_RANKER_MOUNT_SAFETY_CSS = r"""
 /* Dedicated-page mount safety: internal transport controls must never be user-visible. */
@@ -24023,6 +24369,11 @@ def _dedicated_generation_payload(ranker) -> dict:
         profiles = deepcopy(getattr(ranker, "saved_prompts", {}) or {})
         payload = {
             "schema_version": PROFILE_SCHEMA_VERSION,
+            "backend": {
+                "id": LOCAL_GENERATION_BACKEND.backend,
+                "label": LOCAL_GENERATION_BACKEND.display_name,
+                "local": LOCAL_GENERATION_BACKEND.is_local,
+            },
             "settings": {
                 "positive_prompt_text": str(settings.get("positive_prompt_text", "") or ""),
                 "negative_prompt_text": str(settings.get("negative_prompt_text", "") or ""),
@@ -24032,6 +24383,7 @@ def _dedicated_generation_payload(ranker) -> dict:
                 "width": int(settings.get("width", IMG_WIDTH)),
                 "height": int(settings.get("height", IMG_HEIGHT)),
                 "steps": int(settings.get("steps", STEPS)),
+                "cfg_scale": float(settings.get("cfg_scale", DEFAULT_GENERATION_PROFILE_SETTINGS["cfg_scale"])),
                 "sampler": str(settings.get("sampler", DEFAULT_SAMPLER_ID)),
                 "scheduler": str(settings.get("scheduler", "default")),
                 "decrisp_mode": bool(settings.get("decrisp_mode", False)),
@@ -24116,6 +24468,16 @@ def _dedicated_artist_ladder_payload(
     page = records[offset:offset + limit]
     items = []
     for record in page:
+        artist_name = str(record.get("artist", "") or "")
+        portrait_entry = ranker.artist_portraits.get(artist_name)
+        portrait_url = ""
+        if portrait_entry:
+            portrait_version = int(float(portrait_entry.get("updated_at", 0.0) or 0.0))
+            portrait_url = (
+                "/api/duel/artist/portrait?artist="
+                + urllib.parse.quote(artist_name, safe="")
+                + f"&v={portrait_version}"
+            )
         badges = []
         for badge in list(record.get("badges", []) or [])[:8]:
             if not isinstance(badge, dict):
@@ -24123,7 +24485,8 @@ def _dedicated_artist_ladder_payload(
             badges.append({"label": str(badge.get("label", "") or ""), "icon": str(badge.get("icon", "") or "")})
         items.append({
             "rank": int(record.get("rank", 0) or 0),
-            "artist": str(record.get("artist", "") or ""),
+            "artist": artist_name,
+            "portrait_url": portrait_url,
             "favorite": bool(record.get("favorite", False)),
             "top_score": float(record.get("top_score", 0.0) or 0.0),
             "potential_score": float(record.get("potential_score", 0.0) or 0.0),
@@ -24366,6 +24729,7 @@ def launch_with_dedicated_duel_page(ranker, gradio_app):
             or path.startswith("/ranker")
             or path.startswith("/gradio_api/file=")
             or path.startswith("/api/generation-analytics")
+            or path.startswith("/api/generation-control")
         )
         auth = PHONE_PAIRING.authorize_request(request, local=local) if protected else None
         if protected and not public and auth is not None and not auth.authorized:
@@ -24409,12 +24773,19 @@ def launch_with_dedicated_duel_page(ranker, gradio_app):
         local = bool(is_local_request(request))
         paired_devices = PHONE_PAIRING.list_devices() if local else []
         artist_count = len(getattr(getattr(ranker, "artist_manager", None), "artists", []) or [])
-        api_ready = bool(novelai_key_is_configured())
+        api_ready = bool(LOCAL_GENERATION_BACKEND.is_local or novelai_key_is_configured())
+        backend_label = LOCAL_GENERATION_BACKEND.display_name
         first_run_complete = bool(getattr(ranker, "storage_settings", {}).get("first_run_complete", False))
         checks = [
             {
-                "id": "api_key", "ok": api_ready, "label": "NovelAI API key",
-                "detail": "Stored in Windows Credential Manager." if api_ready else "Not configured; open First-run setup on the PC.",
+                "id": "api_key", "ok": api_ready, "label": "Generation backend",
+                "detail": (
+                    f"Local {backend_label} selected."
+                    if LOCAL_GENERATION_BACKEND.is_local
+                    else "NovelAI token stored in Windows Credential Manager."
+                    if api_ready
+                    else "NovelAI token not configured; open First-run setup on the PC."
+                ),
             },
             {
                 "id": "artist_list", "ok": artist_count > 0, "label": "Artist list",
@@ -24803,6 +25174,25 @@ self.addEventListener('fetch',event=>{const url=new URL(event.request.url);if(ev
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+    @server.get("/api/duel/artist/portrait")
+    async def dedicated_mobile_artist_portrait(artist: str):
+        entry = ranker.artist_portraits.get(str(artist or ""))
+        if not entry:
+            raise HTTPException(status_code=404, detail="Artist portrait not found.")
+        portrait_root = Path(ARTIST_PORTRAITS_DIR).resolve()
+        try:
+            portrait_path = Path(str(entry.get("portrait_path", "") or "")).resolve()
+            portrait_path.relative_to(portrait_root)
+        except (OSError, RuntimeError, ValueError):
+            raise HTTPException(status_code=404, detail="Artist portrait is unavailable.")
+        if not portrait_path.is_file():
+            raise HTTPException(status_code=404, detail="Artist portrait is unavailable.")
+        return FileResponse(
+            portrait_path,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "private, max-age=300"},
+        )
+
     @server.get("/api/duel/gallery")
     async def dedicated_mobile_gallery(
         q: str = "",
@@ -24929,6 +25319,7 @@ self.addEventListener('fetch',event=>{const url=new URL(event.request.url);if(ev
             payload.get("width", IMG_WIDTH),
             payload.get("height", IMG_HEIGHT),
             payload.get("steps", STEPS),
+            payload.get("cfg_scale", DEFAULT_GENERATION_PROFILE_SETTINGS["cfg_scale"]),
             str(payload.get("sampler", DEFAULT_SAMPLER_ID) or DEFAULT_SAMPLER_ID),
             str(payload.get("scheduler", "default") or "default"),
             bool(payload.get("decrisp_mode", False)),
@@ -24963,6 +25354,7 @@ self.addEventListener('fetch',event=>{const url=new URL(event.request.url);if(ev
             payload.get("width", IMG_WIDTH),
             payload.get("height", IMG_HEIGHT),
             payload.get("steps", STEPS),
+            payload.get("cfg_scale", DEFAULT_GENERATION_PROFILE_SETTINGS["cfg_scale"]),
             str(payload.get("sampler", DEFAULT_SAMPLER_ID) or DEFAULT_SAMPLER_ID),
             str(payload.get("scheduler", "default") or "default"),
             payload.get("uc_preset", 0),
@@ -25128,6 +25520,138 @@ self.addEventListener('fetch',event=>{const url=new URL(event.request.url);if(ev
         if not is_local_request(request):
             raise HTTPException(status_code=403, detail="This launcher action is available only on the ranker PC.")
 
+    def _require_local_backend_idle() -> None:
+        worker = getattr(ranker, "refill_thread", None)
+        if worker is not None and worker.is_alive():
+            raise HTTPException(
+                status_code=409,
+                detail="Pause generation and wait for the current complete duel to finish before changing endpoints.",
+            )
+
+    @server.get("/api/generation-control/status")
+    async def generation_control_status(request: Request):
+        return JSONResponse({
+            "ok": True,
+            "local_request": bool(is_local_request(request)),
+            "mode": GENERATION_MODE_CONTROL.public_status(),
+            "backend": {
+                "id": LOCAL_GENERATION_BACKEND.backend,
+                "label": LOCAL_GENERATION_BACKEND.display_name,
+                "local": LOCAL_GENERATION_BACKEND.is_local,
+            },
+            "connection": LOCAL_GENERATION_BACKEND.connection_payload(),
+            "previews": ranker.generation_preview_payload(),
+        }, headers={"Cache-Control": "no-store"})
+
+    @server.post("/api/generation-control/mode")
+    async def generation_control_switch_mode(request: Request):
+        _require_public_local(request)
+        payload = await request.json()
+        target = str(payload.get("mode", "") or "").strip().casefold()
+        if target not in {"novelai", "local"}:
+            raise HTTPException(status_code=400, detail="Choose the NovelAI or Local archive.")
+        result = GENERATION_MODE_CONTROL.request_switch(target)
+        if not result.get("changed"):
+            return JSONResponse({"ok": True, "changed": False, "mode": GENERATION_MODE_CONTROL.public_status()})
+        with ranker.state_lock:
+            ranker.generation_paused = True
+
+        def finish_archive_switch() -> None:
+            # Let FastAPI flush the accepted response before a no-refill switch
+            # can reach SIGINT; otherwise the browser sees a spurious network error.
+            time.sleep(0.65)
+            worker = getattr(ranker, "refill_thread", None)
+            if worker is not None and worker.is_alive():
+                worker.join(timeout=max(60.0, float(LOCAL_GENERATION_BACKEND.timeout) * 2.2))
+            try:
+                ranker._persist_runtime_state_now()
+            except Exception as exc:
+                print(f"Warning: final archive-switch persistence failed: {exc}")
+            os.kill(os.getpid(), signal.SIGINT)
+
+        threading.Thread(
+            target=finish_archive_switch,
+            daemon=True,
+            name="generation-archive-switch",
+        ).start()
+        return JSONResponse({
+            "ok": True,
+            "changed": True,
+            "message": "Finishing the active duel, saving this archive, and restarting into the selected mode.",
+            "target_mode": target,
+            "request_id": result.get("request_id", ""),
+        })
+
+    @server.post("/api/generation-control/test")
+    async def generation_control_test(request: Request):
+        _require_public_local(request)
+        payload = await request.json()
+        try:
+            message = LOCAL_GENERATION_BACKEND.healthcheck(
+                str(payload.get("backend", "") or ""),
+                str(payload.get("base_url", "") or ""),
+                bool(payload.get("allow_non_loopback", False)),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return JSONResponse({"ok": True, "message": message})
+
+    @server.post("/api/generation-control/connection")
+    async def generation_control_save_connection(request: Request):
+        _require_public_local(request)
+        _require_local_backend_idle()
+        if GENERATION_MODE != "local":
+            raise HTTPException(status_code=409, detail="Switch to the Local archive before configuring a diffuser.")
+        payload = await request.json()
+        backend = str(payload.get("backend", "") or "")
+        base_url = str(payload.get("base_url", "") or "")
+        allow_lan = bool(payload.get("allow_non_loopback", False))
+        try:
+            message = LOCAL_GENERATION_BACKEND.healthcheck(backend, base_url, allow_lan)
+            connection = LOCAL_GENERATION_BACKEND.save_connection(backend, base_url, allow_lan)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        ranker.api_key_configured = True
+        ranker.last_generation_error = ""
+        ranker.start_refill_if_needed()
+        return JSONResponse({"ok": True, "message": message + " Saved for the Local archive.", "connection": connection})
+
+    @server.post("/api/generation-control/scan")
+    async def generation_control_scan(request: Request):
+        _require_public_local(request)
+        endpoints = await asyncio.to_thread(LOCAL_GENERATION_BACKEND.scan_endpoints)
+        return JSONResponse({"ok": True, "endpoints": endpoints})
+
+    @server.post("/api/generation-control/preview-settings")
+    async def generation_control_preview_settings(request: Request):
+        _require_public_local(request)
+        payload = await request.json()
+        count = ranker.set_live_preview_duels(payload.get("count", 0))
+        return JSONResponse({
+            "ok": True,
+            "count": count,
+            "maximum": MAX_LIVE_PREVIEW_DUELS,
+            "message": (
+                "Live generation previews disabled."
+                if count == 0 else f"Live previews enabled for the first {count} buffered duel(s)."
+            ),
+        })
+
+    @server.get("/api/generation-control/previews")
+    async def generation_control_previews():
+        return JSONResponse(ranker.generation_preview_payload(), headers={"Cache-Control": "no-store"})
+
+    @server.get("/api/generation-control/preview/{slot}/{side}")
+    async def generation_control_preview_image(slot: int, side: str):
+        if slot < 1 or slot > MAX_LIVE_PREVIEW_DUELS or str(side).upper() not in {"A", "B"}:
+            raise HTTPException(status_code=404, detail="Preview image not found.")
+        preview_path = ranker.generation_preview_path(slot, side)
+        if preview_path is None:
+            raise HTTPException(status_code=404, detail="Preview image not found.")
+        data = preview_path.read_bytes()
+        media_type = "image/png" if data.startswith(b"\x89PNG") else "image/webp" if data.startswith(b"RIFF") else "image/jpeg"
+        return Response(data, media_type=media_type, headers={"Cache-Control": "private, no-store"})
+
     @server.get("/api/public/health")
     async def public_launcher_health():
         return JSONResponse({
@@ -25135,6 +25659,8 @@ self.addEventListener('fetch',event=>{const url=new URL(event.request.url);if(ev
             "application": "NovelAI Artist Ranker",
             "version": SHAREABLE_EDITION_VERSION,
             "port": int(SERVER_PORT),
+            "generation_mode": GENERATION_MODE,
+            "generation_backend": LOCAL_GENERATION_BACKEND.backend,
         }, headers={"Cache-Control": "no-store"})
 
     @server.get("/api/public/status")
@@ -25158,6 +25684,9 @@ self.addEventListener('fetch',event=>{const url=new URL(event.request.url);if(ev
             "data_mode": DATA_LAYOUT.active_layout.mode,
             "data_root": str(DATA_LAYOUT.active_layout.root),
             "api_key_configured": bool(novelai_key_is_configured()),
+            "generation_backend": LOCAL_GENERATION_BACKEND.backend,
+            "generation_backend_label": LOCAL_GENERATION_BACKEND.display_name,
+            "generation_ready": bool(LOCAL_GENERATION_BACKEND.is_local or novelai_key_is_configured()),
         }, headers={"Cache-Control": "no-store"})
 
     @server.post("/api/public/generation/toggle")
@@ -25199,6 +25728,7 @@ self.addEventListener('fetch',event=>{const url=new URL(event.request.url);if(ev
             + ARTIST_CONTROLS_HEAD + QOL_UI_HEAD + BOOLEAN_PAGINATION_HEAD
             + DIAGNOSTICS_HEAD + GENERATION_ANALYTICS_HEAD + SECURE_SETUP_HEAD + PHONE_PAIRING_HEAD + PHASE9_SETTINGS_HEAD
             + str(globals().get("QOL_ACCELERATOR_HEAD", "")) + DEDICATED_NAV_BRIDGE_HEAD + FULL_RANKER_V5_HEAD + FULL_RANKER_GUIDANCE_HEAD
+            + GENERATION_CONTROL_HEAD
         ),
         allowed_paths=[str(COMPARISON_IMAGES_DIR)],
     )
@@ -25270,7 +25800,11 @@ def main():
     print(f"Entity notes: {ENTITY_NOTES_FILE}")
     print(f"Artist portraits: {ARTIST_PORTRAITS_FILE}")
     print(f"Server bind host: {LAN_SERVER_HOST}:{SERVER_PORT}")
-    print(f"NovelAI API key: {'Configured' if novelai_key_is_configured() else 'Not configured'}")
+    print(f"Generation backend: {LOCAL_GENERATION_BACKEND.display_name}")
+    if LOCAL_GENERATION_BACKEND.is_local:
+        print(f"Local-generation config: {LOCAL_GENERATION_BACKEND.config_path}")
+    else:
+        print(f"NovelAI API key: {'Configured' if novelai_key_is_configured() else 'Not configured'}")
     lan_urls = discover_lan_urls(SERVER_PORT)
     if lan_urls:
         print("Phone / LAN access URLs:")

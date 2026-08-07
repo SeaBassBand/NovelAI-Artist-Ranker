@@ -14,7 +14,7 @@ import tempfile
 import time
 import zipfile
 
-APP_VERSION = "2.6.2"
+APP_VERSION = "2.6.3"
 ANDROID_VERSION = "1.5.1"
 ANDROID_CODE = 12
 RELEASE_FOLDER = f"NovelAI-Artist-Ranker-v{APP_VERSION}"
@@ -33,7 +33,8 @@ PROGRAM_ALLOWLIST = (
     "artist_elo_ranker_buffered.py", "ranker_data_layout.py", "novelai_credential_store.py",
     "generation_profiles.py", "storage_retention.py", "phone_pairing.py",
     "onboarding_guidance.py", "backup_transfer_recovery.py", "historical_media.py",
-    "lan_hostname.py", "qrcode",
+    "lan_hostname.py", "generation_control_ui.py", "generation_mode_control.py",
+    "dual_archive_transfer.py", "local_generation_backend.py", "anima_artist_tags.txt", "qrcode",
 )
 RUNTIME_FILES = (
     "public_launcher.pyw", "uninstall.pyw", "launcher_guard.ps1", "run_visible.ps1",
