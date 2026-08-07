@@ -51,6 +51,7 @@ EXCLUDED_SUFFIXES = {".jks", ".keystore", ".p12", ".pfx", ".key", ".pem"}
 EXCLUDED_PARTS = {
     "venv", ".git", "__pycache__", ".gradle", "gradle-cache", "toolchain",
     "diagnostics", "retention_quarantine", ".migration-staging", ".duel_previews",
+    "generation_previews",
 }
 EXCLUDED_NAME_FOLDS = frozenset(name.casefold() for name in EXCLUDED_NAMES)
 EXCLUDED_PART_FOLDS = frozenset(part.casefold() for part in EXCLUDED_PARTS)

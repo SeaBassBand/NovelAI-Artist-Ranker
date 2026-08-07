@@ -1,0 +1,36 @@
+{
+  "backend": "comfyui",
+  "allow_non_loopback": false,
+  "request_timeout_seconds": 600,
+  "poll_interval_seconds": 0.5,
+  "comfyui": {
+    "base_url": "http://127.0.0.1:8188",
+    "workflow_api_file": "anima_workflow_api.json",
+    "output_node": "1",
+    "steps": 10,
+    "cfg": 1.0,
+    "sampler_name": "euler",
+    "scheduler": "simple",
+    "bindings": {
+      "positive_prompt": {"node": "11", "input": "text"},
+      "negative_prompt": {"node": "12", "input": "text"},
+      "seed": {"node": "19", "input": "seed"},
+      "steps": {"node": "19", "input": "steps"},
+      "cfg": {"node": "19", "input": "cfg"},
+      "sampler": {"node": "19", "input": "sampler_name"},
+      "scheduler": {"node": "19", "input": "scheduler"},
+      "width": {"node": "28", "input": "width"},
+      "height": {"node": "28", "input": "height"}
+    }
+  },
+  "forge": {
+    "base_url": "http://127.0.0.1:7861",
+    "cfg_scale": 1.0,
+    "steps": 10,
+    "sampler_name": "Euler",
+    "scheduler": "Automatic",
+    "override_settings": {
+      "sd_model_checkpoint": "anima-turbo-v1.0.safetensors"
+    }
+  }
+}
