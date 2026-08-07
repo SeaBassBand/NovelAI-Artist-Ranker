@@ -16,7 +16,7 @@ cryptography==50.0.0
 curl_cffi==0.15.0
 elara==0.5.5
 fake-useragent==2.2.0
-fastapi==0.139.0
+fastapi==0.141.1
 filelock==3.29.7
 fsspec==2026.6.0
 ftfy==6.3.1
