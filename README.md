@@ -3,10 +3,11 @@
 > **Creator's preface**
 >
 > _Hey, im SeaBass i created this thing mostly for myself but as i added more and more stuff i decided that some people might benefit from me sharing it.
-In case you couldn't tell already this entire project was 1000% vibecoded, specifically using chatgpt, even the documentation is done by it, just to let you know, enjoy!
-Also this project should with very little tweaking work with Anima local generation instead of NAI, since they too have a lot of artists tags, let me know if thats something you would want._
+In case you couldn't tell already this entire project was 1000% vibecoded, specifically using chatgpt, even the documentation is done by it, just to let you know, enjoy!_
 
 NovelAI Artist Ranker aims to help you discover strong and appealing artists tag tailored to you, by turning the task into a repeatable simple blind-comparison workflow. It generates controlled A/B image duels, records your choices, and gradually builds personal rankings for individual artist tags and artist combinations. The statistics do the remembering; your only job is to judge two pictures with unreasonable seriousness.
+
+Now supporting both NovelAI and local Anima!
 
 Votes feed a Bayesian pairwise-ranking model, so upsets matter more and uncertainty falls as evidence accumulates. Matchmaking favors comparisons likely to teach the system something while mixing in discovery, follow-ups, and verification and avoiding recent repeats. [See the short technical explanation](#how-scoring-and-matchmaking-work).
 
