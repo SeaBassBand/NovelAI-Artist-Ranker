@@ -57,7 +57,7 @@ python-dotenv==1.2.2
 python-multipart==0.0.32
 pytz==2026.2
 PyYAML==6.0.3
-regex==2026.7.10
+regex==2026.7.19
 requests==2.34.2
 rich==15.0.0
 robust-downloader==0.0.2
